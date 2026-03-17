@@ -159,7 +159,14 @@ export default function AdminHeader() {
           MenuListProps={{ sx: { p: 0 } }}
         >
           <MenuItem onClick={() => closeMenu('orders')}>Đặt hàng</MenuItem>
-          <MenuItem onClick={() => closeMenu('orders')}>Hóa đơn</MenuItem>
+          <MenuItem
+            onClick={() => {
+              closeMenu('orders');
+              navigate('/invoices');
+            }}
+          >
+            Hóa đơn
+          </MenuItem>
           <MenuItem onClick={() => closeMenu('orders')}>Trả hàng</MenuItem>
           <Box sx={{ borderTop: '1px solid', borderColor: 'divider', my: 1 }} />
           <MenuItem onClick={() => closeMenu('orders')}>Đối tác giao hàng</MenuItem>

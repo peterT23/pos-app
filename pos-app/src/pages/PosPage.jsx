@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { 
   Box, 
   Grid, 
@@ -39,7 +39,8 @@ import {
   TableBody,
   TableRow,
   TableCell,
-  CircularProgress
+  CircularProgress,
+  Link
 } from '@mui/material';
 import {
   Person as PersonIcon,
@@ -82,6 +83,7 @@ import { seedDatabase } from '../db/seedData';
  */
 export default function PosPage() {
   const navigate = useNavigate();
+  const location = useLocation();
   const { logout, user } = useAuth();
   // State tìm kiếm
   const [searchTerm, setSearchTerm] = useState('');
@@ -233,6 +235,8 @@ export default function PosPage() {
   const invoiceIdCounterRef = useRef(1);
   const invoiceLabelCounterRef = useRef(2);
   const [activeInvoiceIndex, setActiveInvoiceIndex] = useState(0);
+  const editInitRef = useRef(false);
+  const returnInitRef = useRef(null);
 
   // Lấy state của hóa đơn hiện tại
   const currentInvoice = invoices[activeInvoiceIndex] || {
@@ -325,10 +329,157 @@ export default function PosPage() {
     }
   }, [selectedStoreId]);
 
-  const handleStoreChange = (storeId) => {
+  const handleStoreChange = useCallback((storeId) => {
     setSelectedStoreId(storeId);
     setStoredStoreId(storeId);
-  };
+  }, []);
+
+  const openEditOrderFromAdmin = useCallback(async (orderId) => {
+    if (!orderId) return;
+    try {
+      const res = await apiRequest(`/api/orders/${orderId}`);
+      const order = res?.order;
+      const items = Array.isArray(res?.items) ? res.items : [];
+      if (!order) return;
+
+      // Switch store theo hóa đơn gốc để khớp chi nhánh
+      if (order.storeId) {
+        handleStoreChange(order.storeId);
+      }
+
+      // Tạo tab hóa đơn Update_HD...
+      const nextId = invoiceIdCounterRef.current;
+      const label = `Update_${order.orderCode || order.localId || ''}`;
+      invoiceIdCounterRef.current += 1;
+      const newTabs = [...invoiceTabs, { label, id: nextId }];
+      setInvoiceTabs(newTabs);
+      setActiveInvoiceIndex(nextId);
+
+      // Map items backend -> cartItems của POS
+      await db.open();
+      const mappedItems = await Promise.all(items.map(async (it) => {
+        const productLocalId = String(it.productLocalId || '').trim();
+        const product = productLocalId ? await db.products.get(productLocalId) : null;
+        const fallbackProduct = {
+          localId: productLocalId || generateLocalId(),
+          productCode: it.productCode || '',
+          name: it.productName || '',
+          price: Number(it.price) || 0,
+          allowPoints: true,
+          stock: 0,
+        };
+        return { product: product || fallbackProduct, qty: Number(it.qty) || 0 };
+      }));
+
+      setInvoices((prev) => ({
+        ...prev,
+        [nextId]: {
+          items: mappedItems,
+          returnMode: false,
+          returnOrder: null,
+          returnItems: [],
+          exchangeItems: [],
+          customerPhone: order.customerPhone || '',
+          customerLocalId: order.customerLocalId || '',
+          customerName: order.customerName || '',
+          customerDebt: 0,
+          customerPoints: 0,
+          customerSearchTerm: '',
+          orderNote: order.note || '',
+          paymentMethod: order.paymentMethod || 'cash',
+          amountPaid: Number(order.totalAmount) || 0,
+          discount: Number(order.discount) || 0,
+          discountType: order.discountType || 'vnd',
+          editMeta: {
+            orderMongoId: order._id,
+            orderLocalId: order.localId,
+            orderCode: order.orderCode,
+            storeId: order.storeId,
+          },
+        },
+      }));
+
+      showSnackbar(`Đang chỉnh sửa hóa đơn ${order.orderCode || ''}`, 'info');
+    } catch (e) {
+      console.error(e);
+      showSnackbar('Không mở được hóa đơn để chỉnh sửa', 'error');
+    }
+  }, [handleStoreChange, invoiceTabs]);
+
+  useEffect(() => {
+    if (editInitRef.current) return;
+    const params = new URLSearchParams(location.search || '');
+    const editOrderId = params.get('editOrderId');
+    if (!editOrderId) return;
+    editInitRef.current = true;
+    openEditOrderFromAdmin(editOrderId);
+  }, [location.search, openEditOrderFromAdmin]);
+
+  const openReturnOrderFromAdmin = useCallback(async (orderId) => {
+    if (!orderId) return;
+    try {
+      const res = await apiRequest(`/api/orders/${orderId}`);
+      const order = res?.order;
+      const items = Array.isArray(res?.items) ? res.items : [];
+      if (!order) return;
+
+      // Switch store theo hóa đơn gốc để khớp chi nhánh
+      if (order.storeId) {
+        handleStoreChange(order.storeId);
+      }
+
+      await db.open();
+      const products = await db.products.toArray();
+      const productById = new Map(products.map((p) => [p.localId, p]));
+
+      const mappedReturnItems = items.map((it) => {
+        const p = productById.get(it.productLocalId);
+        return {
+          product: {
+            localId: it.productLocalId,
+            name: it.productName,
+            // Ưu tiên giá bán thực tế (đã giảm) để trả hàng đúng giá đã bán.
+            // basePrice có thể = 0 (không set), nên chỉ fallback khi price không có.
+            price: Number(it.price) || Number(it.basePrice) || 0,
+            barcode: p?.barcode || '',
+            stock: p?.stock ?? 0,
+          },
+          qty: 0,
+          maxQty: Number(it.qty) || 0,
+        };
+      });
+
+      updateCurrentInvoice({
+        returnMode: true,
+        returnOrder: {
+          localId: order.localId,
+          orderCode: order.orderCode || '',
+          customerLabel: order.customerName || '',
+          customerLocalId: order.customerLocalId || '',
+          customerPhone: order.customerPhone || '',
+        },
+        returnItems: mappedReturnItems,
+        exchangeItems: [],
+        customerName: order.customerName || '',
+        customerLocalId: order.customerLocalId || '',
+        customerPhone: order.customerPhone || '',
+      });
+
+      showSnackbar(`Trả hàng / ${order.orderCode || ''}`, 'info');
+    } catch (e) {
+      console.error(e);
+      showSnackbar('Không mở được hóa đơn để trả hàng', 'error');
+    }
+  }, [handleStoreChange]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search || '');
+    const returnOrderId = params.get('returnOrderId');
+    if (!returnOrderId) return;
+    if (returnInitRef.current === returnOrderId) return;
+    returnInitRef.current = returnOrderId;
+    openReturnOrderFromAdmin(returnOrderId);
+  }, [location.search, openReturnOrderFromAdmin]);
 
   const handleCreateStore = async () => {
     if (!newStore.name.trim()) {
@@ -466,7 +617,21 @@ export default function PosPage() {
       return { syncedReturns: 0, syncedItems: 0 };
     }
 
-    const returnIds = returns.map((record) => record.localId);
+    // Normalize để tránh gửi null gây 400 validation (backend yêu cầu string)
+    const normalizedReturns = returns.map((r) => ({
+      ...r,
+      returnCode: r.returnCode || '',
+      orderLocalId: r.orderLocalId || '',
+      orderCode: r.orderCode || '',
+      exchangeOrderLocalId: r.exchangeOrderLocalId || '',
+      exchangeOrderCode: r.exchangeOrderCode || '',
+      cashierId: r.cashierId || '',
+      cashierName: r.cashierName || '',
+      paymentMethod: r.paymentMethod || '',
+      exchangeItems: Array.isArray(r.exchangeItems) ? r.exchangeItems : [],
+    }));
+
+    const returnIds = normalizedReturns.map((record) => record.localId);
     const returnItems = returnIds.length > 0
       ? await db.return_items.where('returnLocalId').anyOf(returnIds).toArray()
       : [];
@@ -477,7 +642,7 @@ export default function PosPage() {
 
     const response = await apiRequest('/api/sync/returns', {
       method: 'POST',
-      body: JSON.stringify({ returns, returnItems: mappedItems }),
+      body: JSON.stringify({ returns: normalizedReturns, returnItems: mappedItems }),
     });
 
     if (returnIds.length > 0) {
@@ -716,6 +881,18 @@ export default function PosPage() {
         orderItemsByOrder.get(item.orderLocalId).push(item);
       });
 
+      const returnEnriched = returns
+        .map((returnItem) => {
+          const customer =
+            (returnItem.customerLocalId && customerById.get(returnItem.customerLocalId)) ||
+            (returnItem.customerPhone && customerByPhone.get(returnItem.customerPhone));
+          return {
+            ...returnItem,
+            customerLabel: formatCustomerLabel(customer) || returnItem.customerPhone || 'Khách lẻ',
+          };
+        })
+        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
       const enriched = orders
         .filter(order => order.status !== 'returned')
         .map((order) => {
@@ -732,28 +909,21 @@ export default function PosPage() {
             })
             .filter(Boolean);
 
+          const returnRecordsForOrder = returnEnriched.filter(
+            (r) => r.orderCode === order.orderCode || r.orderLocalId === order.localId
+          );
+
           return {
             ...order,
             customerLabel: formatCustomerLabel(customer) || order.customerPhone || 'Khách lẻ',
             productNames,
-            productCodes
+            productCodes,
+            returnRecords: returnRecordsForOrder,
           };
         })
         .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
       setReturnOrders(enriched);
-
-      const returnEnriched = returns
-        .map((returnItem) => {
-          const customer =
-            (returnItem.customerLocalId && customerById.get(returnItem.customerLocalId)) ||
-            (returnItem.customerPhone && customerByPhone.get(returnItem.customerPhone));
-          return {
-            ...returnItem,
-            customerLabel: formatCustomerLabel(customer) || returnItem.customerPhone || 'Khách lẻ',
-          };
-        })
-        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
       setReturnRecords(returnEnriched);
     } catch (error) {
       console.error('Lỗi tải đơn hàng trả:', error);
@@ -922,22 +1092,45 @@ export default function PosPage() {
       const returnCode = await generateReturnCode();
       const now = Date.now();
       const hasExchangeItems = cartItems.length > 0;
-      const exchangeOrderLocalId = hasExchangeItems ? generateLocalId() : null;
-      const exchangeOrderCode = hasExchangeItems ? await generateOrderCode() : null;
+
+      // Khi có đổi hàng: cập nhật đơn gốc (HD6), không tạo đơn mới (HD7)
+      const remainingItems = returnItems
+        .map(item => ({
+          product: item.product,
+          qty: Math.max(0, (typeof item.maxQty === 'number' ? item.maxQty : 0) - (Number(item.qty) || 0)),
+        }))
+        .filter(x => x.qty > 0);
+      // Gộp theo productLocalId để tránh cùng mã hàng hiện 2 dòng (còn lại + hàng đổi)
+      const byProduct = new Map();
+      for (const it of [...remainingItems, ...cartItems]) {
+        const key = it.product?.localId ?? '';
+        const existing = byProduct.get(key);
+        const qty = Number(it.qty) || 0;
+        if (existing) {
+          existing.qty += qty;
+        } else {
+          byProduct.set(key, { product: it.product, qty });
+        }
+      }
+      const mergedItems = Array.from(byProduct.values()).filter(x => x.qty > 0);
+      const mergedSubtotal = mergedItems.reduce((sum, it) => sum + (Number(it.product?.price) || 0) * (Number(it.qty) || 0), 0);
+      const mergedOrderDiscount = Number(orderDiscount) || 0;
+      const mergedTotal = Math.max(0, mergedSubtotal - (mergedOrderDiscount || 0));
 
       const returnRecord = {
         localId: returnLocalId,
         returnCode,
         orderLocalId: returnOrder.localId,
-        orderCode: returnOrder.orderCode || null,
-        exchangeOrderLocalId: exchangeOrderLocalId,
-        exchangeOrderCode: exchangeOrderCode,
+        // Backend sync validator không nhận null cho các field string optional
+        orderCode: returnOrder.orderCode || '',
+        exchangeOrderLocalId: '',
+        exchangeOrderCode: '',
         cashierId,
         cashierName: effectiveCashierName,
         customerLocalId: customerLocalId || returnOrder.customerLocalId || null,
         customerPhone: customerPhone || returnOrder.customerPhone || null,
         totalReturnAmount: returnTotalAmount,
-        totalExchangeAmount: totalAmount,
+        totalExchangeAmount: hasExchangeItems ? totalAmount : 0,
         netAmount,
         paymentMethod,
         amountPaid,
@@ -968,44 +1161,36 @@ export default function PosPage() {
         }
 
         if (hasExchangeItems) {
-          const exchangeOrder = {
-            localId: exchangeOrderLocalId,
-            orderCode: exchangeOrderCode,
-            totalAmount: totalAmount,
-            subtotalAmount: subtotalAmount,
-            discount: orderDiscount,
-            discountType: discountType,
-            paymentMethod: paymentMethod,
-            cashierId,
-            cashierName: effectiveCashierName,
-            customerLocalId: customerLocalId || returnOrder.customerLocalId || null,
-            customerPhone: customerPhone || returnOrder.customerPhone || null,
-            pointsUsed: 0,
-            pointsEarned: 0,
-            status: 'completed',
-            createdAt: now,
-            synced: false,
-            note: orderNote,
-          };
-          const exchangeOrderItems = cartItems.map(item => ({
-            orderLocalId: exchangeOrderLocalId,
-            productLocalId: item.product.localId,
-            productName: item.product.name,
-            price: item.product.price,
-            qty: item.qty,
-            subtotal: item.product.price * item.qty,
+          // Cập nhật đơn gốc: thay items bằng (hàng còn lại sau trả + hàng đổi)
+          await db.order_items.where('orderLocalId').equals(returnOrder.localId).delete();
+          const newOrderItems = mergedItems.map(it => ({
+            orderLocalId: returnOrder.localId,
+            productLocalId: it.product.localId,
+            productName: it.product.name,
+            price: Number(it.product.price) || 0,
+            qty: Number(it.qty) || 0,
+            subtotal: (Number(it.product.price) || 0) * (Number(it.qty) || 0),
           }));
-          await db.orders.add(exchangeOrder);
-          if (exchangeOrderItems.length > 0) {
-            await db.order_items.bulkAdd(exchangeOrderItems);
+          if (newOrderItems.length > 0) {
+            await db.order_items.bulkAdd(newOrderItems);
           }
+          await db.orders.update(returnOrder.localId, {
+            subtotalAmount: mergedSubtotal,
+            totalAmount: mergedTotal,
+            discount: mergedOrderDiscount,
+            discountType: discountType || 'vnd',
+            note: orderNote || '',
+            status: 'completed',
+            updatedAt: now,
+            synced: false,
+          });
+        } else {
+          await db.orders.update(returnOrder.localId, {
+            status: 'returned',
+            updatedAt: now,
+            synced: false,
+          });
         }
-
-        await db.orders.update(returnOrder.localId, {
-          status: 'returned',
-          updatedAt: now,
-          synced: false,
-        });
 
         for (const item of itemsToReturn) {
           const product = await db.products.get(item.product.localId);
@@ -1030,13 +1215,47 @@ export default function PosPage() {
         }
       });
 
+      if (hasExchangeItems && returnOrder.orderCode) {
+        try {
+          await apiRequest(`/api/orders/${returnOrder.orderCode}/replace`, {
+            method: 'POST',
+            body: JSON.stringify({
+              subtotalAmount: mergedSubtotal,
+              totalAmount: mergedTotal,
+              discount: mergedOrderDiscount,
+              discountType: discountType || 'vnd',
+              paymentMethod,
+              customerLocalId: customerLocalId || returnOrder.customerLocalId || null,
+              customerPhone: customerPhone || returnOrder.customerPhone || null,
+              note: orderNote || '',
+              items: mergedItems.map(it => ({
+                productLocalId: it.product.localId,
+                productName: it.product.name,
+                basePrice: Number(it.product.price) || 0,
+                discount: 0,
+                discountType: 'vnd',
+                price: Number(it.product.price) || 0,
+                qty: Number(it.qty) || 0,
+                subtotal: (Number(it.product.price) || 0) * (Number(it.qty) || 0),
+              })),
+            }),
+          });
+          await db.orders.update(returnOrder.localId, { synced: true });
+        } catch (replaceErr) {
+          console.warn('Replace order on server failed:', replaceErr);
+          showSnackbar('Đã lưu trả hàng; cần đồng bộ đơn hàng lên server', 'warning');
+        }
+      }
+
       showSnackbar(`Đã lưu đơn trả hàng ${returnCode}`, 'success');
       syncReturnsToServer().catch((error) => {
         console.warn('Sync returns failed:', error);
       });
-      syncOrdersToServer().catch((error) => {
-        console.warn('Sync orders failed:', error);
-      });
+      if (!hasExchangeItems) {
+        syncOrdersToServer().catch((error) => {
+          console.warn('Sync orders failed:', error);
+        });
+      }
       syncMasterToServer().catch((error) => {
         console.warn('Sync master failed:', error);
       });
@@ -1658,6 +1877,75 @@ export default function PosPage() {
     }
 
     try {
+      const editMeta = currentInvoice?.editMeta;
+      if (editMeta?.orderMongoId) {
+        await apiRequest(`/api/orders/${editMeta.orderMongoId}/replace`, {
+          method: 'POST',
+          body: JSON.stringify({
+            subtotalAmount,
+            totalAmount,
+            discount: orderDiscount,
+            discountType,
+            paymentMethod,
+            customerLocalId: customerLocalId || null,
+            customerPhone: customerPhone || null,
+            note: orderNote || '',
+            items: cartItems.map((item) => ({
+              productLocalId: item.product.localId,
+              productName: item.product.name,
+              basePrice: Number(item.product.price) || 0,
+              discount: Number(item.discount) || 0,
+              discountType: item.discountType || 'vnd',
+              price: Number(calculateItemFinalPrice(item)) || 0,
+              qty: item.qty,
+              subtotal: (Number(calculateItemFinalPrice(item)) || 0) * (Number(item.qty) || 0),
+            })),
+          }),
+        });
+
+        // Đóng tab Update sau khi cập nhật xong
+        setInvoices((prev) => {
+          const next = { ...prev };
+          delete next[activeInvoiceIndex];
+          return next;
+        });
+        const newTabs = invoiceTabs.filter((t) => t.id !== activeInvoiceIndex);
+        setInvoiceTabs(newTabs);
+        if (newTabs.length > 0) {
+          setActiveInvoiceIndex(newTabs[newTabs.length - 1].id);
+        } else {
+          const newInvoiceId = 0;
+          setInvoiceTabs([{ label: 'Hóa đơn 1', id: newInvoiceId }]);
+          setInvoices({
+            [newInvoiceId]: {
+              items: [],
+              returnMode: false,
+              returnOrder: null,
+              returnItems: [],
+              exchangeItems: [],
+              customerPhone: '',
+              customerLocalId: '',
+              customerName: '',
+              customerDebt: 0,
+              customerPoints: 0,
+              customerSearchTerm: '',
+              orderNote: '',
+              paymentMethod: 'cash',
+              amountPaid: 0,
+              discount: 0,
+              discountType: 'vnd',
+            },
+          });
+          invoiceIdCounterRef.current = 1;
+          invoiceLabelCounterRef.current = 2;
+          setActiveInvoiceIndex(newInvoiceId);
+        }
+
+        setSearchTerm('');
+        showSnackbar(`Cập nhật hóa đơn thành công! Mã đơn: ${editMeta.orderCode || ''}`, 'success');
+        return;
+      }
+
       // Tạo ID cho đơn hàng (UUID)
       const orderLocalId = generateLocalId();
       
@@ -1837,63 +2125,77 @@ export default function PosPage() {
         console.warn('Sync master failed:', error);
       });
 
-      // Xóa hóa đơn sau khi thanh toán thành công
-      // filter(): Tạo mảng mới không chứa hóa đơn đã thanh toán
-      // (_, i): Bỏ qua giá trị, chỉ lấy index
+      // Xóa hóa đơn sau khi thanh toán thành công và reset ô khách hàng cho hóa đơn tiếp theo
       const activeTabIndex = invoiceTabs.findIndex((tab) => tab.id === activeInvoiceIndex);
       const safeActiveIndex = activeTabIndex >= 0 ? activeTabIndex : 0;
       const newTabs = invoiceTabs.filter((_, i) => i !== safeActiveIndex);
-      
-      // Xóa state của hóa đơn đã thanh toán
-      // Lấy ID của hóa đơn đã thanh toán
       const paidInvoiceId =
         invoiceTabs[safeActiveIndex]?.id !== undefined
           ? invoiceTabs[safeActiveIndex].id
           : activeInvoiceIndex;
-      // Functional update: Xóa invoice khỏi state
-      setInvoices(prev => {
-        const newInvoices = { ...prev };  // Copy object cũ
-        delete newInvoices[paidInvoiceId]; // Xóa key khỏi object
-        return newInvoices;                // Trả về object mới
+
+      const nextIndex = newTabs.length > 0
+        ? (safeActiveIndex >= newTabs.length ? newTabs.length - 1 : safeActiveIndex)
+        : 0;
+      const nextActiveId = newTabs.length > 0
+        ? (newTabs[nextIndex]?.id ?? newTabs[0]?.id ?? 0)
+        : 0;
+
+      const emptyCustomerState = {
+        customerPhone: '',
+        customerLocalId: '',
+        customerName: '',
+        customerDebt: 0,
+        customerPoints: 0,
+        customerSearchTerm: '',
+      };
+
+      setInvoices((prev) => {
+        if (newTabs.length === 0) {
+          return {
+            [nextActiveId]: {
+              items: [],
+              returnMode: false,
+              returnOrder: null,
+              returnItems: [],
+              exchangeItems: [],
+              ...emptyCustomerState,
+              orderNote: '',
+              paymentMethod: 'cash',
+              amountPaid: 0,
+              discount: 0,
+              discountType: 'vnd',
+            },
+          };
+        }
+        const next = { ...prev };
+        delete next[paidInvoiceId];
+        if (nextActiveId != null && next[nextActiveId]) {
+          next[nextActiveId] = { ...next[nextActiveId], ...emptyCustomerState };
+        }
+        return next;
       });
 
-      // Cập nhật tabs: Set mảng tabs mới (đã xóa tab đã thanh toán)
       setInvoiceTabs(newTabs);
-      
-      // Chuyển sang hóa đơn khác hoặc tạo mới nếu không còn hóa đơn nào
-      if (newTabs.length > 0) {
-        // Chuyển sang hóa đơn trước đó hoặc hóa đơn cuối cùng
-        const nextIndex = safeActiveIndex >= newTabs.length ? newTabs.length - 1 : safeActiveIndex;
-        const nextActiveId = newTabs[nextIndex]?.id ?? newTabs[0]?.id ?? 0;
-        setActiveInvoiceIndex(nextActiveId);
-      } else {
-        // Tạo hóa đơn mới nếu không còn hóa đơn nào
-        const newInvoiceId = 0;
-        setInvoiceTabs([{ label: 'Hóa đơn 1', id: newInvoiceId }]);
-        setInvoices({
-          [newInvoiceId]: {
-            items: [],
-            returnMode: false,
-            returnOrder: null,
-            returnItems: [],
-            exchangeItems: [],
-            customerPhone: '',
-            customerLocalId: '',
-            customerName: '',
-            customerDebt: 0,
-            customerPoints: 0,
-            customerSearchTerm: '',
-            orderNote: '',
-            paymentMethod: 'cash',
-            amountPaid: 0,
-            discount: 0,
-            discountType: 'vnd',
-          }
-        });
+      setActiveInvoiceIndex(nextActiveId);
+
+      if (newTabs.length === 0) {
         invoiceIdCounterRef.current = 1;
         invoiceLabelCounterRef.current = 2;
-        setActiveInvoiceIndex(newInvoiceId);
       }
+
+      // Đảm bảo ô khách hàng trống sau khi state đã áp dụng (tránh race)
+      setTimeout(() => {
+        setInvoices((prev) => {
+          if (prev[nextActiveId]) {
+            return {
+              ...prev,
+              [nextActiveId]: { ...prev[nextActiveId], ...emptyCustomerState },
+            };
+          }
+          return prev;
+        });
+      }, 0);
       
       setSearchTerm('');
 
@@ -3718,6 +4020,7 @@ export default function PosPage() {
                           <TableCell>Thời gian</TableCell>
                           <TableCell>Nhân viên</TableCell>
                           <TableCell>Khách hàng</TableCell>
+                          <TableCell>Mã trả hàng</TableCell>
                           <TableCell align="right">Tổng cộng</TableCell>
                           <TableCell align="right"> </TableCell>
                         </>
@@ -3737,7 +4040,7 @@ export default function PosPage() {
                     {returnDialogTab === 0 ? (
                       returnOrdersLoading ? (
                         <TableRow>
-                          <TableCell colSpan={6}>
+                          <TableCell colSpan={7}>
                             <Box sx={{ py: 4, display: 'flex', justifyContent: 'center' }}>
                               <CircularProgress size={24} />
                             </Box>
@@ -3745,7 +4048,7 @@ export default function PosPage() {
                         </TableRow>
                       ) : filteredReturnOrders.length === 0 ? (
                         <TableRow>
-                          <TableCell colSpan={6}>
+                          <TableCell colSpan={7}>
                             <Typography variant="body2" color="text.secondary">
                               Không tìm thấy hóa đơn phù hợp
                             </Typography>
@@ -3758,6 +4061,7 @@ export default function PosPage() {
                             createdAt && !Number.isNaN(createdAt.getTime())
                               ? createdAt.toLocaleString('vi-VN', { hour12: false })
                               : '';
+                          const returnRecords = order.returnRecords || [];
                           return (
                             <TableRow key={order.localId || order.orderCode}>
                               <TableCell sx={{ color: 'primary.main', fontWeight: 600 }}>
@@ -3766,6 +4070,28 @@ export default function PosPage() {
                               <TableCell>{createdAtLabel}</TableCell>
                               <TableCell>{cashierName}</TableCell>
                               <TableCell>{order.customerLabel}</TableCell>
+                              <TableCell>
+                                {returnRecords.length === 0 ? (
+                                  '—'
+                                ) : (
+                                  <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+                                    {returnRecords.map((rec) => (
+                                      <Link
+                                        key={rec.localId}
+                                        component="button"
+                                        variant="body2"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleOpenReturnDetail(rec);
+                                        }}
+                                        sx={{ color: 'primary.main', textAlign: 'left', cursor: 'pointer' }}
+                                      >
+                                        {rec.returnCode || rec.localId}
+                                      </Link>
+                                    ))}
+                                  </Box>
+                                )}
+                              </TableCell>
                               <TableCell align="right">
                                 {(Number(order.totalAmount) || 0).toLocaleString('vi-VN')}
                               </TableCell>
