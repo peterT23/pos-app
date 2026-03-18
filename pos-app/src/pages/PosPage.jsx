@@ -1117,6 +1117,22 @@ export default function PosPage() {
       const mergedOrderDiscount = Number(orderDiscount) || 0;
       const mergedTotal = Math.max(0, mergedSubtotal - (mergedOrderDiscount || 0));
 
+      /** Điểm: + theo giá trị hàng đổi (SP cho phép tích điểm), − theo giá trị hàng trả — khớp tiền thực tế đổi/trả */
+      const POINTS_PER_VND = 50000;
+      const returnEligibleForPoints = itemsToReturn.reduce((sum, item) => {
+        if (item.product?.allowPoints === false) return sum;
+        return sum + (Number(item.product.price) || 0) * (Number(item.qty) || 0);
+      }, 0);
+      const exchangeEligibleForPoints = hasExchangeItems
+        ? cartItems.reduce((sum, item) => {
+            if (item.product?.allowPoints === false) return sum;
+            return sum + calculateItemFinalPrice(item) * (Number(item.qty) || 0);
+          }, 0)
+        : 0;
+      const pointsDeductedReturn = Math.floor(returnEligibleForPoints / POINTS_PER_VND);
+      const pointsAddedExchange = Math.floor(exchangeEligibleForPoints / POINTS_PER_VND);
+      const pointsDelta = pointsAddedExchange - pointsDeductedReturn;
+
       const returnRecord = {
         localId: returnLocalId,
         returnCode,
@@ -1142,7 +1158,10 @@ export default function PosPage() {
           price: item.product.price,
           qty: item.qty,
           subtotal: item.product.price * item.qty,
-        }))
+        })),
+        pointsDelta,
+        pointsAddedExchange,
+        pointsDeductedReturn,
       };
 
       const returnItemRecords = itemsToReturn.map(item => ({
@@ -1154,7 +1173,7 @@ export default function PosPage() {
         subtotal: item.product.price * item.qty,
       }));
 
-      await db.transaction('rw', db.returns, db.return_items, db.products, db.orders, db.order_items, async () => {
+      await db.transaction('rw', db.returns, db.return_items, db.products, db.orders, db.order_items, db.customers, async () => {
         await db.returns.add(returnRecord);
         if (returnItemRecords.length > 0) {
           await db.return_items.bulkAdd(returnItemRecords);
@@ -1213,6 +1232,24 @@ export default function PosPage() {
             });
           }
         }
+
+        if (pointsDelta !== 0) {
+          let cust = null;
+          const cid = customerLocalId || returnOrder.customerLocalId;
+          if (cid) cust = await db.customers.get(cid);
+          if (!cust) {
+            const ph = String(customerPhone || returnOrder.customerPhone || '').trim();
+            if (ph) cust = await db.customers.where('phone').equals(ph).first();
+          }
+          if (cust) {
+            const newPts = Math.max(0, (Number(cust.points) || 0) + pointsDelta);
+            await db.customers.update(cust.localId, {
+              points: newPts,
+              updatedAt: now,
+              synced: false,
+            });
+          }
+        }
       });
 
       if (hasExchangeItems && returnOrder.orderCode) {
@@ -1247,7 +1284,13 @@ export default function PosPage() {
         }
       }
 
-      showSnackbar(`Đã lưu đơn trả hàng ${returnCode}`, 'success');
+      const ptsDetail =
+        pointsAddedExchange > 0 || pointsDeductedReturn > 0
+          ? ` (${[pointsAddedExchange > 0 ? `+${pointsAddedExchange} đổi` : '', pointsDeductedReturn > 0 ? `−${pointsDeductedReturn} trả` : ''].filter(Boolean).join(', ')})`
+          : '';
+      const ptsMsg =
+        pointsDelta !== 0 ? ` — Điểm ${pointsDelta > 0 ? '+' : ''}${pointsDelta}${ptsDetail}` : '';
+      showSnackbar(`Đã lưu đơn trả hàng ${returnCode}${ptsMsg}`, 'success');
       syncReturnsToServer().catch((error) => {
         console.warn('Sync returns failed:', error);
       });
@@ -1266,7 +1309,13 @@ export default function PosPage() {
         exchangeItems: [],
         items: [],
         amountPaid: 0,
-        paymentMethod: 'cash'
+        paymentMethod: 'cash',
+        customerPhone: '',
+        customerLocalId: '',
+        customerName: '',
+        customerDebt: 0,
+        customerPoints: 0,
+        customerSearchTerm: '',
       });
     } catch (error) {
       console.error('Lỗi khi trả hàng:', error);
@@ -2125,21 +2174,29 @@ export default function PosPage() {
         console.warn('Sync master failed:', error);
       });
 
-      // Xóa hóa đơn sau khi thanh toán thành công và reset ô khách hàng cho hóa đơn tiếp theo
-      const activeTabIndex = invoiceTabs.findIndex((tab) => tab.id === activeInvoiceIndex);
-      const safeActiveIndex = activeTabIndex >= 0 ? activeTabIndex : 0;
-      const newTabs = invoiceTabs.filter((_, i) => i !== safeActiveIndex);
-      const paidInvoiceId =
-        invoiceTabs[safeActiveIndex]?.id !== undefined
-          ? invoiceTabs[safeActiveIndex].id
-          : activeInvoiceIndex;
+      // Xóa hóa đơn đã thanh toán; reset khách cho hóa đơn còn lại / mới (theo tab.id — tránh lệch index)
+      const paidInvoiceId = activeInvoiceIndex;
+      const closingTabIndex = invoiceTabs.findIndex((t) => t.id === paidInvoiceId);
+      const newTabs = invoiceTabs.filter((t) => t.id !== paidInvoiceId);
 
-      const nextIndex = newTabs.length > 0
-        ? (safeActiveIndex >= newTabs.length ? newTabs.length - 1 : safeActiveIndex)
-        : 0;
-      const nextActiveId = newTabs.length > 0
-        ? (newTabs[nextIndex]?.id ?? newTabs[0]?.id ?? 0)
-        : 0;
+      const emptyInvoiceBase = {
+        items: [],
+        returnMode: false,
+        returnOrder: null,
+        returnItems: [],
+        exchangeItems: [],
+        customerPhone: '',
+        customerLocalId: '',
+        customerName: '',
+        customerDebt: 0,
+        customerPoints: 0,
+        customerSearchTerm: '',
+        orderNote: '',
+        paymentMethod: 'cash',
+        amountPaid: 0,
+        discount: 0,
+        discountType: 'vnd',
+      };
 
       const emptyCustomerState = {
         customerPhone: '',
@@ -2150,50 +2207,42 @@ export default function PosPage() {
         customerSearchTerm: '',
       };
 
-      setInvoices((prev) => {
-        if (newTabs.length === 0) {
-          return {
-            [nextActiveId]: {
-              items: [],
-              returnMode: false,
-              returnOrder: null,
-              returnItems: [],
-              exchangeItems: [],
-              ...emptyCustomerState,
-              orderNote: '',
-              paymentMethod: 'cash',
-              amountPaid: 0,
-              discount: 0,
-              discountType: 'vnd',
-            },
-          };
-        }
-        const next = { ...prev };
-        delete next[paidInvoiceId];
-        if (nextActiveId != null && next[nextActiveId]) {
-          next[nextActiveId] = { ...next[nextActiveId], ...emptyCustomerState };
-        }
-        return next;
-      });
-
-      setInvoiceTabs(newTabs);
-      setActiveInvoiceIndex(nextActiveId);
-
+      let nextActiveId = 0;
       if (newTabs.length === 0) {
+        nextActiveId = 0;
+        setInvoices({ 0: { ...emptyInvoiceBase } });
+        setInvoiceTabs([{ label: 'Hóa đơn 1', id: 0 }]);
+        setActiveInvoiceIndex(0);
         invoiceIdCounterRef.current = 1;
         invoiceLabelCounterRef.current = 2;
+      } else {
+        const focusIdx =
+          closingTabIndex >= 0
+            ? Math.min(closingTabIndex, newTabs.length - 1)
+            : newTabs.length - 1;
+        nextActiveId = newTabs[focusIdx].id;
+
+        setInvoices((prev) => {
+          const next = { ...prev };
+          delete next[paidInvoiceId];
+          const existing = next[nextActiveId];
+          next[nextActiveId] = existing
+            ? { ...existing, ...emptyCustomerState }
+            : { ...emptyInvoiceBase };
+          return next;
+        });
+        setInvoiceTabs(newTabs);
+        setActiveInvoiceIndex(nextActiveId);
       }
 
-      // Đảm bảo ô khách hàng trống sau khi state đã áp dụng (tránh race)
       setTimeout(() => {
         setInvoices((prev) => {
-          if (prev[nextActiveId]) {
-            return {
-              ...prev,
-              [nextActiveId]: { ...prev[nextActiveId], ...emptyCustomerState },
-            };
-          }
-          return prev;
+          const cur = prev[nextActiveId];
+          if (!cur) return prev;
+          return {
+            ...prev,
+            [nextActiveId]: { ...cur, ...emptyCustomerState },
+          };
         });
       }, 0);
       
@@ -2495,7 +2544,11 @@ export default function PosPage() {
                   </Box>
                   <Box sx={{ mt: 2 }}>
                     <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
-                      {netAmount >= 0 ? 'Khách thanh toán' : 'Tiền trả khách'}
+                      {netAmount > 0
+                        ? 'Khách trả tiền'
+                        : netAmount < 0
+                          ? 'Đã trả khách'
+                          : 'Không chênh lệch'}
                     </Typography>
                     <TextField
                       fullWidth
@@ -4337,6 +4390,15 @@ export default function PosPage() {
                       ? 'Cần trả khách'
                       : 'Không chênh lệch';
                 const diffValue = Math.abs(amountDifference);
+                const deltaBuyVsReturn = totalExchangeAmount - totalReturnAmount;
+                const cashFlowAmount =
+                  Number(returnDetail.amountPaid) || Math.abs(deltaBuyVsReturn);
+                const paymentFlowLabel =
+                  deltaBuyVsReturn > 0
+                    ? 'Khách trả tiền'
+                    : deltaBuyVsReturn < 0
+                      ? 'Đã trả khách'
+                      : 'Không chênh lệch tiền';
                 const customerName = returnDetail.customerName || returnDetail.customerLabel || '';
                 const customerPhone = returnDetail.customerPhone || '';
                 const paymentMethodLabel =
@@ -4405,10 +4467,12 @@ export default function PosPage() {
                     </Box>
                     <Box>
                       <Typography variant="body2" color="text.secondary">
-                        Khách thanh toán
+                        {paymentFlowLabel}
                       </Typography>
                       <Typography variant="body2">
-                        {(Number(returnDetail.amountPaid) || 0).toLocaleString('vi-VN')}
+                        {deltaBuyVsReturn === 0
+                          ? '0'
+                          : cashFlowAmount.toLocaleString('vi-VN')}
                       </Typography>
                     </Box>
                   </Box>

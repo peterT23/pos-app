@@ -13,6 +13,7 @@ import PurchaseOrdersPage from './pages/PurchaseOrdersPage';
 import PurchaseOrderNewPage from './pages/PurchaseOrderNewPage';
 import PurchaseReturnPage from './pages/PurchaseReturnPage';
 import InvoicesPage from './pages/InvoicesPage';
+import CustomersPage from './pages/CustomersPage';
 import './App.css';
 
 function App() {
@@ -92,6 +93,14 @@ function App() {
             element={(
               <RequireAuth>
                 <InvoicesPage />
+              </RequireAuth>
+            )}
+          />
+          <Route
+            path="/customers"
+            element={(
+              <RequireAuth>
+                <CustomersPage />
               </RequireAuth>
             )}
           />

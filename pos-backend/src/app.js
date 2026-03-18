@@ -20,6 +20,7 @@ const purchaseOrderRoutes = require('./routes/purchaseOrderRoutes');
 const purchaseReturnRoutes = require('./routes/purchaseReturnRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const returnRoutes = require('./routes/returnRoutes');
+const customerRoutes = require('./routes/customerRoutes');
 
 const app = express();
 
@@ -69,6 +70,7 @@ app.use('/api/purchase-orders', purchaseOrderRoutes);
 app.use('/api/purchase-returns', purchaseReturnRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/returns', returnRoutes);
+app.use('/api/customers', customerRoutes);
 
 app.use((err, req, res, next) => {
   // eslint-disable-next-line no-console

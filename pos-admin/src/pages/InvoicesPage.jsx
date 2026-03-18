@@ -907,6 +907,17 @@ export default function InvoicesPage() {
             const r = returnDetailData.return || {};
             const returnItems = returnDetailData.returnItems || [];
             const exchangeItems = returnDetailData.exchangeItems || [];
+            const totalRet = Number(r.totalReturnAmount) || 0;
+            const totalBuy = Number(r.totalExchangeAmount) || 0;
+            const deltaBuyVsReturn = totalBuy - totalRet;
+            const flowLabel =
+              deltaBuyVsReturn > 0
+                ? 'Khách trả tiền'
+                : deltaBuyVsReturn < 0
+                  ? 'Đã trả khách'
+                  : 'Không chênh lệch tiền';
+            const flowAmount =
+              deltaBuyVsReturn === 0 ? 0 : Number(r.amountPaid) || Math.abs(deltaBuyVsReturn);
             return (
               <Box sx={{ pt: 0 }}>
                 <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, mb: 2 }}>
@@ -918,7 +929,7 @@ export default function InvoicesPage() {
                   <Box><Typography variant="caption" color="text.secondary">Hình thức thanh toán</Typography><Typography variant="body2">{r.paymentMethod === 'transfer' ? 'Chuyển khoản' : 'Tiền mặt'}</Typography></Box>
                   <Box><Typography variant="caption" color="text.secondary">Tổng tiền trả hàng</Typography><Typography variant="body2">{formatMoney(r.totalReturnAmount)}</Typography></Box>
                   <Box><Typography variant="caption" color="text.secondary">Tổng tiền mua hàng</Typography><Typography variant="body2">{formatMoney(r.totalExchangeAmount)}</Typography></Box>
-                  <Box><Typography variant="caption" color="text.secondary">Khách thanh toán</Typography><Typography variant="body2">{formatMoney(r.amountPaid)}</Typography></Box>
+                  <Box><Typography variant="caption" color="text.secondary">{flowLabel}</Typography><Typography variant="body2">{formatMoney(flowAmount)}</Typography></Box>
                 </Box>
                 <Typography variant="subtitle2" sx={{ fontWeight: 600, mb: 1 }}>Sản phẩm đã trả</Typography>
                 <TableContainer component={Paper} variant="outlined" sx={{ mb: 2 }}>

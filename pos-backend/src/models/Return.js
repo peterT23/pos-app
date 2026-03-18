@@ -21,6 +21,10 @@ const returnSchema = new mongoose.Schema(
     amountPaid: { type: Number, default: 0 },
     createdAt: { type: Number },
     exchangeItems: { type: Array, default: [] },
+    /** Điểm cộng/trừ khi trả/đổi (đồng bộ từ POS) */
+    pointsDelta: { type: Number, default: 0 },
+    pointsAddedExchange: { type: Number, default: 0 },
+    pointsDeductedReturn: { type: Number, default: 0 },
   },
   { timestamps: true }
 );

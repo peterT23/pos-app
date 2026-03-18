@@ -205,18 +205,35 @@ async function listOrders(req, res) {
   }
 
   const customerLocalIds = [...new Set(orders.map((o) => o.customerLocalId).filter(Boolean))];
-  const customerMap = new Map();
-  if (customerLocalIds.length > 0) {
+  const customerPhones = [
+    ...new Set(
+      orders
+        .filter((o) => !o.customerLocalId)
+        .map((o) => o.customerPhone)
+        .filter(Boolean)
+    ),
+  ];
+  const customerMapByLocalId = new Map();
+  const customerMapByPhone = new Map();
+  if (customerLocalIds.length > 0 || customerPhones.length > 0) {
     const customers = await Customer.find({
       userId: effectiveUserId,
-      localId: { $in: customerLocalIds },
+      $or: [
+        ...(customerLocalIds.length > 0 ? [{ localId: { $in: customerLocalIds } }] : []),
+        ...(customerPhones.length > 0 ? [{ phone: { $in: customerPhones } }] : []),
+      ],
     }).lean();
-    customers.forEach((c) => customerMap.set(c.localId, { customerCode: c.customerCode || '', name: c.name || '' }));
+    customers.forEach((c) => {
+      if (c.localId) customerMapByLocalId.set(c.localId, { customerCode: c.customerCode || '', name: c.name || '' });
+      if (c.phone) customerMapByPhone.set(c.phone, { customerCode: c.customerCode || '', name: c.name || '' });
+    });
   }
 
   const list = orders.map((order) => {
     const returnCodes = returnsByOrderCode.get(order.orderCode || order.localId) || [];
-    const cust = order.customerLocalId ? customerMap.get(order.customerLocalId) : null;
+    const cust = order.customerLocalId
+      ? customerMapByLocalId.get(order.customerLocalId)
+      : (order.customerPhone ? customerMapByPhone.get(order.customerPhone) : null);
     return {
       _id: order._id,
       localId: order.localId,
@@ -224,7 +241,7 @@ async function listOrders(req, res) {
       createdAt: order.createdAt,
       returnCodes,
       customerCode: cust?.customerCode || order.customerLocalId || '',
-      customerName: cust?.name || order.customerPhone || 'Khách lẻ',
+      customerName: cust?.name || 'Khách lẻ',
       totalAmount: Number(order.totalAmount) || 0,
       discount: Number(order.discount) || 0,
       status: order.status || 'completed',
@@ -273,7 +290,9 @@ async function getOrder(req, res) {
     }).lean(),
     order.customerLocalId
       ? Customer.findOne({ userId: effectiveUserId, localId: order.customerLocalId }).lean()
-      : Promise.resolve(null),
+      : (order.customerPhone
+        ? Customer.findOne({ userId: effectiveUserId, phone: order.customerPhone }).lean()
+        : Promise.resolve(null)),
   ]);
 
   // Gộp items theo productLocalId để tránh cùng mã hàng hiện nhiều dòng (sau đổi trả/sync trùng)

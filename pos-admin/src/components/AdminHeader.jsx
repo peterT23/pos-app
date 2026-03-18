@@ -181,7 +181,14 @@ export default function AdminHeader() {
           PaperProps={{ sx: { p: 2, borderRadius: 2 } }}
           MenuListProps={{ sx: { p: 0 } }}
         >
-          <MenuItem onClick={() => closeMenu('customers')}>Danh sách khách hàng</MenuItem>
+          <MenuItem
+            onClick={() => {
+              closeMenu('customers');
+              navigate('/customers');
+            }}
+          >
+            Danh sách khách hàng
+          </MenuItem>
           <MenuItem onClick={() => closeMenu('customers')}>Nhóm khách hàng</MenuItem>
         </Menu>
         <Button color="inherit" onClick={(e) => openMenu('staff', e)}>Nhân viên</Button>
