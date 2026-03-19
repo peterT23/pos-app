@@ -10,6 +10,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   FormControlLabel,
   IconButton,
   InputAdornment,
@@ -61,6 +62,31 @@ function formatDT(ts) {
   });
 }
 
+function paymentMethodLabel(m) {
+  const x = String(m || '').toLowerCase();
+  if (x === 'cash' || x === 'tiền mặt') return 'Tiền mặt';
+  if (x === 'transfer' || x === 'bank' || x === 'chuyển khoản') return 'Chuyển khoản';
+  if (x === 'card' || x === 'thẻ') return 'Thẻ';
+  if (x === 'cod') return 'COD';
+  return m || 'Bán trực tiếp';
+}
+
+function lineDiscountLabel(item) {
+  const d = Number(item.discount) || 0;
+  if (d <= 0) return '—';
+  if (item.discountType === 'percent') return `${d}%`;
+  return `${formatMoney(d)} đ`;
+}
+
+function invoiceDiscountAmount(goodsSubtotal, order) {
+  const disc = Number(order?.discount) || 0;
+  if (disc <= 0) return 0;
+  if (order?.discountType === 'percent') {
+    return Math.round((goodsSubtotal * Math.min(100, disc)) / 100);
+  }
+  return disc;
+}
+
 const DETAIL_TABS = [
   { id: 'info', label: 'Thông tin' },
   { id: 'address', label: 'Địa chỉ nhận hàng' },
@@ -76,6 +102,9 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
   const [salesDetailError, setSalesDetailError] = useState('');
   const [salesDetail, setSalesDetail] = useState(null);
 
+  const [productMiniOpen, setProductMiniOpen] = useState(false);
+  const [productMini, setProductMini] = useState(null);
+
   useEffect(() => {
     if (!id) return;
     if (tab === 'sales' && !cache.orders) loadSlice('orders');
@@ -88,6 +117,23 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
   const ledger = cache.ledger || [];
   const points = cache.points || [];
   const loading = cache.loading;
+
+  const orderView = salesDetail?.type === 'order' ? salesDetail.data : null;
+  const ordModal = orderView?.order;
+  const invLineItems = (() => {
+    if (!orderView) return [];
+    if (Array.isArray(orderView.invoiceLineItems) && orderView.invoiceLineItems.length > 0) {
+      return orderView.invoiceLineItems;
+    }
+    return Array.isArray(orderView.items) ? orderView.items : [];
+  })();
+  const invGoodsSubtotal =
+    orderView && typeof orderView.invoiceGoodsSubtotal === 'number'
+      ? orderView.invoiceGoodsSubtotal
+      : invLineItems.reduce((s, i) => s + (Number(i.subtotal) || 0), 0);
+  const invDiscAmount = ordModal ? invoiceDiscountAmount(invGoodsSubtotal, ordModal) : 0;
+  const invEstimatedPay = Math.max(0, invGoodsSubtotal - invDiscAmount);
+  const invLineQtySum = invLineItems.reduce((s, i) => s + (Number(i.qty) || 0), 0);
 
   const salesRows = useMemo(() => {
     const POINTS_PER_VND = 50000;
@@ -130,8 +176,9 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
     setSalesDetailError('');
     setSalesDetail(null);
     try {
+      const oid = encodeURIComponent(row.detailId);
       if (row.kind === 'order') {
-        const data = await apiRequest(`/api/orders/${row.detailId}`);
+        const data = await apiRequest(`/api/orders/${oid}`);
         const returnIds = Array.isArray(data?.order?.returnIds) ? data.order.returnIds : [];
         let returnDetails = [];
         if (returnIds.length > 0) {
@@ -139,7 +186,7 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
           const results = await Promise.allSettled(
             returnIds.map(async (rid) => {
               try {
-                return apiRequest(`/api/returns/${rid}`);
+                return apiRequest(`/api/returns/${encodeURIComponent(rid)}`);
               } catch {
                 return null;
               }
@@ -151,7 +198,7 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
         }
         setSalesDetail({ type: 'order', data, returnDetails });
       } else {
-        const data = await apiRequest(`/api/returns/${row.detailId}`);
+        const data = await apiRequest(`/api/returns/${oid}`);
         setSalesDetail({ type: 'return', data });
       }
     } catch (e) {
@@ -159,6 +206,12 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
     } finally {
       setSalesDetailLoading(false);
     }
+  };
+
+  const openProductMini = (it) => {
+    if (!it) return;
+    setProductMini(it);
+    setProductMiniOpen(true);
   };
 
   return (
@@ -469,12 +522,12 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
         )}
       </Box>
 
-      <Dialog open={salesDetailOpen} onClose={() => setSalesDetailOpen(false)} maxWidth="md" fullWidth>
+      <Dialog open={salesDetailOpen} onClose={() => setSalesDetailOpen(false)} maxWidth="lg" fullWidth>
         <DialogTitle>
           {salesDetailLoading
             ? 'Đang tải...'
             : salesDetail?.type === 'order'
-              ? `Chi tiết hóa đơn bán: ${salesDetail?.data?.order?.orderCode || ''}`
+              ? `Hóa đơn ${salesDetail?.data?.order?.orderCode || ''}`
               : salesDetail?.type === 'return'
                 ? `Chi tiết trả/đổi: ${salesDetail?.data?.return?.returnCode || ''}`
                 : 'Chi tiết'}
@@ -492,39 +545,121 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
             </Box>
           ) : salesDetail?.type === 'order' ? (
             <>
-              <Box sx={{ mb: 2 }}>
-                <Typography variant="body2" color="text.secondary">
-                  Khách: {salesDetail?.data?.order?.customerName || 'Khách lẻ'}
+              <Box
+                sx={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 1,
+                  mb: 2,
+                }}
+              >
+                <Typography variant="body1" fontWeight={700}>
+                  Khách: {ordModal?.customerName || 'Khách lẻ'}
                 </Typography>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
+                  <Chip
+                    size="small"
+                    label={ordModal?.status === 'cancelled' ? 'Đã hủy' : 'Hoàn thành'}
+                    color={ordModal?.status === 'cancelled' ? 'error' : 'success'}
+                    sx={{ fontWeight: 700 }}
+                  />
+                  <Typography variant="body2" color="text.secondary">
+                    Chi nhánh: {ordModal?.storeId || '—'}
+                  </Typography>
+                </Box>
               </Box>
-              <Table size="small">
-                <TableHead>
-                  <TableRow sx={{ bgcolor: 'grey.100' }}>
-                    <TableCell>Sản phẩm</TableCell>
-                    <TableCell align="right">SL</TableCell>
-                    <TableCell align="right">Đơn giá</TableCell>
-                    <TableCell align="right">Thành tiền</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {(salesDetail?.data?.items || []).length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={4} align="center" sx={{ py: 4 }}>
-                        Không có dữ liệu
-                      </TableCell>
+              <Grid container spacing={1.5} sx={{ mb: 2 }}>
+                {[
+                  ['Người bán', ordModal?.cashierName || '—'],
+                  ['Ngày bán', formatDT(ordModal?.createdAt)],
+                  ['Kênh bán', paymentMethodLabel(ordModal?.paymentMethod)],
+                  ['Ghi chú', ordModal?.note || 'Chưa có ghi chú'],
+                ].map(([k, v]) => (
+                  <Grid size={{ xs: 12, sm: 6 }} key={k}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      {k}
+                    </Typography>
+                    <Typography variant="body2">{v}</Typography>
+                  </Grid>
+                ))}
+              </Grid>
+              <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 0.5 }}>
+                Hàng hóa theo hóa đơn gốc (đã cộng lại phần đã trả để hiển thị đúng SL lúc bán)
+              </Typography>
+              <TableContainer component={Paper} variant="outlined" sx={{ mb: 2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow sx={{ bgcolor: 'grey.100' }}>
+                      <TableCell>Mã hàng</TableCell>
+                      <TableCell>Tên hàng</TableCell>
+                      <TableCell align="right">SL</TableCell>
+                      <TableCell align="right">Đơn giá</TableCell>
+                      <TableCell align="right">Giảm giá</TableCell>
+                      <TableCell align="right">Giá bán</TableCell>
+                      <TableCell align="right">Thành tiền</TableCell>
                     </TableRow>
-                  ) : (
-                    salesDetail.data.items.map((it) => (
-                      <TableRow key={it._id || it.productLocalId}>
-                        <TableCell>{it.productName}</TableCell>
-                        <TableCell align="right">{it.qty}</TableCell>
-                        <TableCell align="right">{formatMoney(it.price)}</TableCell>
-                        <TableCell align="right">{formatMoney(it.subtotal)}</TableCell>
+                  </TableHead>
+                  <TableBody>
+                    {invLineItems.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={7} align="center" sx={{ py: 4 }}>
+                          Không có dữ liệu dòng hàng
+                        </TableCell>
                       </TableRow>
-                    ))
-                  )}
-                </TableBody>
-              </Table>
+                    ) : (
+                      invLineItems.map((it) => (
+                        <TableRow key={it._id || it.productLocalId}>
+                          <TableCell sx={{ fontWeight: 600, color: 'primary.main' }}>
+                            {it.productCode || it.productLocalId || '—'}
+                          </TableCell>
+                          <TableCell>{it.productName || '—'}</TableCell>
+                          <TableCell align="right">{it.qty}</TableCell>
+                          <TableCell align="right">{formatMoney(it.basePrice || it.price)}</TableCell>
+                          <TableCell align="right">{lineDiscountLabel(it)}</TableCell>
+                          <TableCell align="right">{formatMoney(it.price)}</TableCell>
+                          <TableCell align="right">{formatMoney(it.subtotal)}</TableCell>
+                        </TableRow>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+              <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2 }}>
+                <Box sx={{ minWidth: 280 }}>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.5 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      Tổng tiền hàng
+                    </Typography>
+                    <Typography variant="body2" fontWeight={600}>
+                      {formatMoney(invGoodsSubtotal)} đ ({invLineQtySum})
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.5 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      Giảm giá hóa đơn
+                    </Typography>
+                    <Typography variant="body2" fontWeight={600}>
+                      {ordModal?.discountType === 'percent'
+                        ? `${Number(ordModal?.discount) || 0}%`
+                        : `${formatMoney(ordModal?.discount)} đ`}
+                    </Typography>
+                  </Box>
+                  <Divider sx={{ my: 0.5 }} />
+                  <Box sx={{ display: 'flex', justifyContent: 'space-between', py: 0.5 }}>
+                    <Typography variant="body2" fontWeight={700}>
+                      Khách cần trả (ước tính theo dòng)
+                    </Typography>
+                    <Typography variant="body2" fontWeight={700}>
+                      {formatMoney(invEstimatedPay)} đ
+                    </Typography>
+                  </Box>
+                  <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }}>
+                    Tổng trên hệ thống sau trả/hủy: {formatMoney(ordModal?.totalAmount)} đ
+                  </Typography>
+                </Box>
+              </Box>
 
               {Array.isArray(salesDetail?.returnDetails) && salesDetail.returnDetails.length > 0 && (
                 <>
@@ -623,12 +758,69 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
           ) : salesDetail?.type === 'return' ? (
             <>
               <Box sx={{ mb: 2 }}>
-                <Typography variant="body2" color="text.secondary">
-                  Mã đơn gốc: {salesDetail?.data?.return?.orderCode || salesDetail?.data?.return?.orderLocalId || '—'}
-                </Typography>
-                <Typography variant="body2" color="text.secondary">
-                  Net: {formatMoney(Number(salesDetail?.data?.return?.netAmount || 0))} đ
-                </Typography>
+                <Grid container spacing={1.5}>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Mã trả hàng
+                    </Typography>
+                    <Typography variant="body2" fontWeight={700}>
+                      {salesDetail?.data?.return?.returnCode || salesDetail?.data?.return?.localId || '—'}
+                    </Typography>
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Thời gian trả
+                    </Typography>
+                    <Typography variant="body2">
+                      {formatDT(salesDetail?.data?.return?.createdAt)}
+                    </Typography>
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Người bán
+                    </Typography>
+                    <Typography variant="body2">{salesDetail?.data?.return?.cashierName || '—'}</Typography>
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Hình thức thanh toán
+                    </Typography>
+                    <Typography variant="body2">
+                      {paymentMethodLabel(salesDetail?.data?.return?.paymentMethod)}
+                    </Typography>
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Khách
+                    </Typography>
+                    <Typography variant="body2">
+                      {salesDetail?.data?.return?.customerName || salesDetail?.data?.return?.customerCode || '—'}
+                    </Typography>
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">
+                      Hóa đơn gốc
+                    </Typography>
+                    <Typography variant="body2">
+                      {salesDetail?.data?.return?.orderCode || salesDetail?.data?.return?.orderLocalId ? (
+                        <Link
+                          href="#"
+                          underline="hover"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            const oc = salesDetail?.data?.return?.orderCode || salesDetail?.data?.return?.orderLocalId || '';
+                            window.location.assign(`/invoices?search=${encodeURIComponent(oc)}`);
+                          }}
+                          sx={{ fontWeight: 700 }}
+                        >
+                          {salesDetail?.data?.return?.orderCode || salesDetail?.data?.return?.orderLocalId}
+                        </Link>
+                      ) : (
+                        '—'
+                      )}
+                    </Typography>
+                  </Grid>
+                </Grid>
               </Box>
 
               <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
@@ -637,6 +829,7 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
               <Table size="small" sx={{ mb: 2 }}>
                 <TableHead>
                   <TableRow sx={{ bgcolor: 'grey.100' }}>
+                    <TableCell>Mã hàng</TableCell>
                     <TableCell>Sản phẩm</TableCell>
                     <TableCell align="right">SL</TableCell>
                     <TableCell align="right">Đơn giá</TableCell>
@@ -646,13 +839,26 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
                 <TableBody>
                   {(salesDetail?.data?.returnItems || []).length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={4} align="center" sx={{ py: 4 }}>
+                      <TableCell colSpan={5} align="center" sx={{ py: 4 }}>
                         Không có
                       </TableCell>
                     </TableRow>
                   ) : (
                     salesDetail.data.returnItems.map((it, idx) => (
                       <TableRow key={`${it.productName}-${idx}`}>
+                        <TableCell sx={{ minWidth: 140 }}>
+                          <Link
+                            href="#"
+                            underline="hover"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              openProductMini(it);
+                            }}
+                            sx={{ color: 'primary.main', fontWeight: 700 }}
+                          >
+                            {it.productCode || it.productLocalId || '—'}
+                          </Link>
+                        </TableCell>
                         <TableCell>{it.productName}</TableCell>
                         <TableCell align="right">{it.qty}</TableCell>
                         <TableCell align="right">{formatMoney(it.price)}</TableCell>
@@ -669,6 +875,7 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
               <Table size="small">
                 <TableHead>
                   <TableRow sx={{ bgcolor: 'grey.100' }}>
+                    <TableCell>Mã hàng</TableCell>
                     <TableCell>Sản phẩm</TableCell>
                     <TableCell align="right">SL</TableCell>
                     <TableCell align="right">Đơn giá</TableCell>
@@ -678,13 +885,26 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
                 <TableBody>
                   {(salesDetail?.data?.exchangeItems || []).length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={4} align="center" sx={{ py: 4 }}>
+                      <TableCell colSpan={5} align="center" sx={{ py: 4 }}>
                         Không có
                       </TableCell>
                     </TableRow>
                   ) : (
                     salesDetail.data.exchangeItems.map((it, idx) => (
                       <TableRow key={`${it.productName}-${idx}`}>
+                        <TableCell sx={{ minWidth: 140 }}>
+                          <Link
+                            href="#"
+                            underline="hover"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              openProductMini(it);
+                            }}
+                            sx={{ color: 'primary.main', fontWeight: 700 }}
+                          >
+                            {it.productCode || it.productLocalId || '—'}
+                          </Link>
+                        </TableCell>
                         <TableCell>{it.productName}</TableCell>
                         <TableCell align="right">{it.qty}</TableCell>
                         <TableCell align="right">{formatMoney(it.price)}</TableCell>
@@ -701,6 +921,43 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setSalesDetailOpen(false)}>Đóng</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={productMiniOpen} onClose={() => setProductMiniOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Mã hàng hóa</DialogTitle>
+        <DialogContent>
+          {productMini ? (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.2, pt: 0.5 }}>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">Mã hàng</Typography>
+                <Typography variant="body2" fontWeight={700}>
+                  {productMini.productCode || productMini.productLocalId || '—'}
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">Tên hàng</Typography>
+                <Typography variant="body2">{productMini.productName || '—'}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">Số lượng</Typography>
+                <Typography variant="body2">{productMini.qty || 0}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">Đơn giá</Typography>
+                <Typography variant="body2">{formatMoney(productMini.price || 0)} đ</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">Thành tiền</Typography>
+                <Typography variant="body2">{formatMoney(productMini.subtotal || 0)} đ</Typography>
+              </Box>
+            </Box>
+          ) : (
+            <Typography color="text.secondary">Không có dữ liệu</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProductMiniOpen(false)}>Đóng</Button>
         </DialogActions>
       </Dialog>
     </Box>

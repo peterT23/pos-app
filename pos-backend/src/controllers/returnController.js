@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const Return = require('../models/Return');
 const ReturnItem = require('../models/ReturnItem');
+const Customer = require('../models/Customer');
+const Product = require('../models/Product');
 
 /**
  * GET /api/returns/:id - Lấy chi tiết một đơn trả hàng theo _id, returnCode hoặc localId
@@ -33,8 +35,21 @@ async function getReturn(req, res) {
 
   const returnItems = await ReturnItem.find({
     userId: effectiveUserId,
+    storeId: record.storeId,
     returnLocalId: record.localId,
   }).lean();
+
+  const customer = record.customerLocalId
+    ? await Customer.findOne({ userId: effectiveUserId, localId: record.customerLocalId }).lean()
+    : (record.customerPhone
+      ? await Customer.findOne({ userId: effectiveUserId, phone: record.customerPhone }).lean()
+      : null);
+
+  const productLocalIds = [...new Set(returnItems.map((i) => String(i.productLocalId || '').trim()).filter(Boolean))];
+  const products = productLocalIds.length > 0
+    ? await Product.find({ userId: effectiveUserId, storeId: record.storeId, localId: { $in: productLocalIds } }).lean()
+    : [];
+  const productByLocalId = new Map(products.map((p) => [p.localId, p]));
 
   return res.json({
     return: {
@@ -42,8 +57,13 @@ async function getReturn(req, res) {
       returnCode: record.returnCode || record.localId,
       orderCode: record.orderCode || record.orderLocalId || '',
       exchangeOrderCode: record.exchangeOrderCode || null,
+      customerCode: customer?.customerCode || record.customerLocalId || '',
+      customerName: customer?.name || record.customerPhone || 'Khách lẻ',
+      customerPhone: record.customerPhone || '',
     },
     returnItems: returnItems.map((item) => ({
+      productLocalId: item.productLocalId,
+      productCode: productByLocalId.get(item.productLocalId)?.productCode || '',
       productName: item.productName,
       qty: item.qty,
       price: item.price,

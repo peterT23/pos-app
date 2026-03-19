@@ -1,6 +1,7 @@
 const Order = require('../models/Order');
 const OrderItem = require('../models/OrderItem');
 const Return = require('../models/Return');
+const ReturnItem = require('../models/ReturnItem');
 const Product = require('../models/Product');
 const Customer = require('../models/Customer');
 const Store = require('../models/Store');
@@ -254,6 +255,174 @@ async function listOrders(req, res) {
   return res.json({ orders: list, total });
 }
 
+/**
+ * Chỉ lấy OrderItem của đúng một chi nhánh — không gộp default + chi nhánh
+ * (tránh double sau sync / replaceOrder chỉ xóa theo storeId của HĐ).
+ */
+async function findOrderItemsForInvoice(userId, orderLocalId, orderStoreId) {
+  const sid = orderStoreId || 'default';
+
+  let rows = await OrderItem.find({
+    userId,
+    orderLocalId,
+    storeId: sid,
+  }).lean();
+
+  if (rows.length === 0 && sid !== 'default') {
+    rows = await OrderItem.find({
+      userId,
+      orderLocalId,
+      storeId: 'default',
+    }).lean();
+  }
+
+  if (rows.length === 0) {
+    const all = await OrderItem.find({ userId, orderLocalId }).lean();
+    if (all.length === 0) return [];
+    const byStore = new Map();
+    for (const it of all) {
+      const s = it.storeId || 'default';
+      if (!byStore.has(s)) byStore.set(s, []);
+      byStore.get(s).push(it);
+    }
+    if (byStore.has(sid)) {
+      rows = byStore.get(sid);
+    } else if (byStore.has('default')) {
+      rows = byStore.get('default');
+    } else {
+      rows = Array.from(byStore.values())[0];
+    }
+  }
+
+  return rows;
+}
+
+/** Trùng sync: cùng mã phiếu hoặc cùng localId */
+function dedupeReturnDocuments(docs) {
+  const seenLocal = new Set();
+  const seenCode = new Set();
+  const sorted = [...docs].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const out = [];
+  for (const r of sorted) {
+    const lid = String(r.localId || '').trim();
+    const code = String(r.returnCode || '').trim();
+    if (lid && seenLocal.has(lid)) continue;
+    if (code && seenCode.has(code)) continue;
+    if (lid) seenLocal.add(lid);
+    if (code) seenCode.add(code);
+    out.push(r);
+  }
+  return out;
+}
+
+function orderItemUpdatedMs(it) {
+  const u = it.updatedAt;
+  if (u instanceof Date) return u.getTime();
+  if (typeof u === 'number' && u > 1e12) return u;
+  if (typeof u === 'string') {
+    const t = new Date(u).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+  const c = it.createdAt;
+  if (c instanceof Date) return c.getTime();
+  if (typeof c === 'number') return c;
+  return 0;
+}
+
+/**
+ * Cùng SP nhiều dòng (sync lỗi / replace không xóa hết): KHÔNG cộng dồn — giữ bản mới nhất.
+ */
+function mergeOrderItemsByProductLatest(rows) {
+  const byPid = new Map();
+  for (const item of rows) {
+    const key = String(item.productLocalId || '').trim() || String(item._id || '');
+    if (!key) continue;
+    const t = orderItemUpdatedMs(item);
+    const prev = byPid.get(key);
+    if (!prev) {
+      byPid.set(key, { item, t });
+      continue;
+    }
+    if (t > prev.t) {
+      byPid.set(key, { item, t });
+    } else if (t === prev.t) {
+      const li = String(item.localId || '');
+      const lp = String(prev.item.localId || '');
+      if (li > lp) byPid.set(key, { item, t });
+    }
+  }
+  return Array.from(byPid.values()).map(({ item }) => ({
+    ...item,
+    qty: Number(item.qty) || 0,
+    subtotal: Number(item.subtotal) || 0,
+    price: Number(item.price) || 0,
+  }));
+}
+
+/**
+ * Khi chỉ 1 dòng hàng nhưng tổng thành tiền lệch so với (tiền HĐ hiện tại + tổng trả), chỉnh qty/subtotal cho khớp tiền thật.
+ */
+function reconcileSingleLineInvoiceWithMoney(order, returnsDeduped, invoiceLines) {
+  if (!Array.isArray(invoiceLines) || invoiceLines.length !== 1) return invoiceLines;
+  const retMoney = returnsDeduped.reduce((s, r) => s + (Number(r.totalReturnAmount) || 0), 0);
+  const sub = Number(order.subtotalAmount);
+  const tot = Number(order.totalAmount);
+  const baseGoods = !Number.isNaN(sub) && sub > 0 ? sub : tot;
+  if (Number.isNaN(baseGoods) || baseGoods < 0) return invoiceLines;
+  const impliedOriginal = baseGoods + retMoney;
+  if (impliedOriginal <= 0) return invoiceLines;
+
+  const disc = Number(order.discount) || 0;
+  if (disc > 0) {
+    return invoiceLines;
+  }
+
+  const lineSum = invoiceLines.reduce((s, i) => s + (Number(i.subtotal) || 0), 0);
+  if (Math.abs(lineSum - impliedOriginal) < 500) return invoiceLines;
+
+  const it = { ...invoiceLines[0] };
+  const unit = Number(it.price) || 0;
+  if (unit <= 0) return invoiceLines;
+  const qty = Math.round(impliedOriginal / unit);
+  if (qty <= 0) return invoiceLines;
+  const recomputed = qty * unit;
+  if (Math.abs(recomputed - impliedOriginal) > unit * 0.5) return invoiceLines;
+
+  it.qty = qty;
+  it.subtotal = recomputed;
+  return [it];
+}
+
+/** Gộp dòng ReturnItem trùng (cùng phiếu + cùng SP) */
+function aggregateReturnItemsForInvoice(rows) {
+  const m = new Map();
+  for (const ri of rows) {
+    const pid = String(ri.productLocalId || '').trim();
+    const rloc = String(ri.returnLocalId || '').trim();
+    if (!pid || !rloc) continue;
+    const key = `${rloc}::${pid}`;
+    const q = Number(ri.qty) || 0;
+    const st = Number(ri.subtotal) || 0;
+    const pr = Number(ri.price) || 0;
+    const ex = m.get(key);
+    if (ex) {
+      ex.qty += q;
+      ex.subtotal += st;
+    } else {
+      m.set(key, {
+        ...ri,
+        productLocalId: pid,
+        returnLocalId: rloc,
+        qty: q,
+        subtotal: st,
+        price: pr,
+        productName: ri.productName || '',
+      });
+    }
+  }
+  return Array.from(m.values());
+}
+
 async function getOrder(req, res) {
   const userId = req.user?.sub;
   const role = req.user?.role;
@@ -279,8 +448,13 @@ async function getOrder(req, res) {
     return res.status(404).json({ message: 'Không tìm thấy đơn hàng' });
   }
 
-  const [items, returns, customer] = await Promise.all([
-    OrderItem.find({ userId: effectiveUserId, orderLocalId: order.localId, storeId: order.storeId }).lean(),
+  const items = await findOrderItemsForInvoice(
+    effectiveUserId,
+    order.localId,
+    order.storeId,
+  );
+
+  const [returnsRaw, customer] = await Promise.all([
     Return.find({
       userId: effectiveUserId,
       $or: [
@@ -295,44 +469,109 @@ async function getOrder(req, res) {
         : Promise.resolve(null)),
   ]);
 
-  // Gộp items theo productLocalId để tránh cùng mã hàng hiện nhiều dòng (sau đổi trả/sync trùng)
-  const itemsByProduct = new Map();
-  for (const item of items) {
-    const key = item.productLocalId || item._id.toString();
-    const existing = itemsByProduct.get(key);
-    const qty = Number(item.qty) || 0;
-    const subtotal = Number(item.subtotal) || 0;
-    const price = Number(item.price) || 0;
-    if (existing) {
-      existing.qty += qty;
-      existing.subtotal += subtotal;
-    } else {
-      itemsByProduct.set(key, {
-        ...item,
-        qty,
-        subtotal,
-        price,
+  const returns = dedupeReturnDocuments(returnsRaw);
+
+  // Trùng productLocalId: giữ bản OrderItem mới nhất (không cộng dồn — tránh 20+20=40)
+  const mergedItems = mergeOrderItemsByProductLatest(items);
+
+  const returnLocalIds = returns.map((r) => r.localId).filter(Boolean);
+  let allReturnItems = [];
+  if (returnLocalIds.length > 0) {
+    allReturnItems = await ReturnItem.find({
+      userId: effectiveUserId,
+      returnLocalId: { $in: returnLocalIds },
+    }).lean();
+  }
+  const returnItemsAgg = aggregateReturnItemsForInvoice(allReturnItems);
+
+  /** Dòng hàng ước tính tại thời điểm bán: cộng lại SL đã trả (vì replaceOrder có thể đã ghi đè còn lại) */
+  function buildInvoiceLineItems(merged, returnRows) {
+    const byPid = new Map();
+    for (const it of merged) {
+      const pid = String(it.productLocalId || '').trim() || String(it._id || '');
+      if (!pid) continue;
+      byPid.set(pid, {
+        ...it,
+        productLocalId: pid,
+        qty: Number(it.qty) || 0,
+        subtotal: Number(it.subtotal) || 0,
+        price: Number(it.price) || 0,
+        productName: it.productName || '',
+        basePrice: Number(it.basePrice) || Number(it.price) || 0,
+        discount: Number(it.discount) || 0,
+        discountType: it.discountType === 'percent' ? 'percent' : 'vnd',
       });
     }
+    for (const ri of returnRows) {
+      const pid = String(ri.productLocalId || '').trim();
+      if (!pid) continue;
+      const q = Number(ri.qty) || 0;
+      const st = Number(ri.subtotal) || 0;
+      const pr = Number(ri.price) || 0;
+      const ex = byPid.get(pid);
+      if (ex) {
+        ex.qty += q;
+        ex.subtotal += st;
+        if (!ex.productName && ri.productName) ex.productName = ri.productName;
+      } else {
+        byPid.set(pid, {
+          productLocalId: pid,
+          productName: ri.productName || '',
+          qty: q,
+          price: pr,
+          basePrice: pr,
+          discount: 0,
+          discountType: 'vnd',
+          subtotal: st,
+        });
+      }
+    }
+    return Array.from(byPid.values());
   }
-  const mergedItems = Array.from(itemsByProduct.values());
 
-  const productLocalIds = [...new Set(mergedItems.map((i) => i.productLocalId))];
+  let invoiceMerged = buildInvoiceLineItems(mergedItems, returnItemsAgg);
+  invoiceMerged = reconcileSingleLineInvoiceWithMoney(order, returns, invoiceMerged);
+
+  const productLocalIds = [
+    ...new Set([
+      ...mergedItems.map((i) => i.productLocalId).filter(Boolean),
+      ...invoiceMerged.map((i) => i.productLocalId).filter(Boolean),
+    ]),
+  ];
   const products = await Product.find({
     userId: effectiveUserId,
-    storeId: order.storeId,
     localId: { $in: productLocalIds },
+    $or: [{ storeId: order.storeId }, { storeId: 'default' }],
   }).lean();
-  const productCodeByLocalId = new Map(products.map((p) => [p.localId, p.productCode || p.localId]));
+  const productByLocalId = new Map();
+  for (const p of products) {
+    const id = p.localId;
+    const prev = productByLocalId.get(id);
+    if (!prev || (prev.storeId !== order.storeId && p.storeId === order.storeId)) {
+      productByLocalId.set(id, p);
+    }
+  }
+  const codeOnly = (localId) => {
+    const p = productByLocalId.get(localId);
+    return (p && (p.productCode || p.localId)) || localId;
+  };
 
   const returnCodes = returns.map((r) => r.returnCode || r.localId);
   const returnIdByCode = new Map(returns.map((r) => [r.returnCode || r.localId, r._id.toString()]));
 
   const orderItems = mergedItems.map((item) => ({
     ...item,
-    productCode: productCodeByLocalId.get(item.productLocalId) || item.productLocalId,
+    productCode: codeOnly(item.productLocalId),
     returnId: returnCodes.length > 0 ? returnIdByCode.get(returnCodes[0]) : null,
   }));
+
+  const invoiceLineItems = invoiceMerged.map((item) => ({
+    ...item,
+    productCode: codeOnly(item.productLocalId),
+    returnId: returnCodes.length > 0 ? returnIdByCode.get(returnCodes[0]) : null,
+  }));
+
+  const invoiceGoodsSubtotal = invoiceLineItems.reduce((s, i) => s + (Number(i.subtotal) || 0), 0);
 
   return res.json({
     order: {
@@ -344,6 +583,8 @@ async function getOrder(req, res) {
       returnIds: returns.map((r) => r._id.toString()),
     },
     items: orderItems,
+    invoiceLineItems,
+    invoiceGoodsSubtotal,
   });
 }
 

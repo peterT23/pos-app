@@ -184,6 +184,14 @@ export default function PosPage() {
   const [returnDetailOpen, setReturnDetailOpen] = useState(false);
   const [returnDetailLoading, setReturnDetailLoading] = useState(false);
   const [returnDetail, setReturnDetail] = useState(null);
+
+  // Chi tiết hóa đơn (hiển thị khi bấm vào mã HD trong lịch sử bán/trả)
+  const [orderHistoryDetailOpen, setOrderHistoryDetailOpen] = useState(false);
+  const [orderHistoryDetailLoading, setOrderHistoryDetailLoading] = useState(false);
+  const [orderHistoryDetail, setOrderHistoryDetail] = useState(null);
+
+  const [productMiniOpen, setProductMiniOpen] = useState(false);
+  const [productMini, setProductMini] = useState(null);
   const [returnSearchField, setReturnSearchField] = useState('orderCode');
   const [returnSearchTerm, setReturnSearchTerm] = useState('');
   const [returnFromDate, setReturnFromDate] = useState('');
@@ -1387,6 +1395,82 @@ export default function PosPage() {
     } finally {
       setReturnDetailLoading(false);
     }
+  };
+
+  // Mở dialog trả hàng từ backend (dùng cho phần hiển thị "link" trong modal chi tiết HD)
+  const openReturnDetailFromApi = async (returnIdOrCode) => {
+    if (!returnIdOrCode) return;
+    try {
+      setReturnDetailLoading(true);
+      const res = await apiRequest(`/api/returns/${encodeURIComponent(returnIdOrCode)}`);
+      const ret = res?.return;
+      if (!ret) return;
+      setReturnDetail({
+        ...ret,
+        returnItems: Array.isArray(res?.returnItems) ? res.returnItems : [],
+        exchangeItems: Array.isArray(res?.exchangeItems) ? res.exchangeItems : [],
+      });
+      setReturnDetailOpen(true);
+    } catch (e) {
+      console.error(e);
+      showSnackbar('Không tải được chi tiết trả hàng', 'error');
+    } finally {
+      setReturnDetailLoading(false);
+    }
+  };
+
+  // Mở dialog chi tiết hóa đơn bán hàng (từ lịch sử bán/trả trong pos-app)
+  const handleOpenOrderHistoryDetail = async (order) => {
+    if (!order) return;
+    const orderIdOrCode = order?.orderCode || order?.localId || '';
+    if (!orderIdOrCode) return;
+    try {
+      setOrderHistoryDetailLoading(true);
+      setOrderHistoryDetailOpen(true);
+
+      const res = await apiRequest(`/api/orders/${encodeURIComponent(orderIdOrCode)}`);
+      const ord = res?.order;
+      if (!ord) return;
+
+      const invoiceLineItems = Array.isArray(res?.invoiceLineItems)
+        ? res.invoiceLineItems
+        : (Array.isArray(res?.items) ? res.items : []);
+
+      const returnIds = Array.isArray(ord?.returnIds) ? ord.returnIds : [];
+      const returnDetailResults = returnIds.length
+        ? await Promise.allSettled(
+          returnIds.map((rid) => apiRequest(`/api/returns/${encodeURIComponent(rid)}`)),
+        )
+        : [];
+      const returnDetails = returnDetailResults
+        .filter((r) => r.status === 'fulfilled' && r.value?.return)
+        .map((r) => {
+          const v = r.value;
+          return {
+            ...(v?.return || {}),
+            returnItems: Array.isArray(v?.returnItems) ? v.returnItems : [],
+            exchangeItems: Array.isArray(v?.exchangeItems) ? v.exchangeItems : [],
+          };
+        });
+
+      setOrderHistoryDetail({
+        ...ord,
+        invoiceLineItems,
+        invoiceGoodsSubtotal: res?.invoiceGoodsSubtotal ?? null,
+        returnDetails,
+      });
+    } catch (e) {
+      console.error(e);
+      showSnackbar('Không tải được chi tiết hóa đơn', 'error');
+    } finally {
+      setOrderHistoryDetailLoading(false);
+    }
+  };
+
+  const openProductMini = (it) => {
+    if (!it) return;
+    setProductMini(it);
+    setProductMiniOpen(true);
   };
 
 
@@ -3484,8 +3568,18 @@ export default function PosPage() {
 
                           return (
                             <TableRow key={order?.localId || order?.orderCode}>
-                              <TableCell sx={{ color: 'primary.main', fontWeight: 600 }}>
-                                {order?.orderCode || order?.localId || ''}
+                              <TableCell>
+                                <Link
+                                  component="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleOpenOrderHistoryDetail(order);
+                                  }}
+                                  sx={{ color: 'primary.main', fontWeight: 600, textAlign: 'left', cursor: 'pointer' }}
+                                  underline="hover"
+                                >
+                                  {order?.orderCode || order?.localId || ''}
+                                </Link>
                               </TableCell>
                               <TableCell>{createdAtLabel}</TableCell>
                               <TableCell>{cashierName}</TableCell>
@@ -4389,6 +4483,268 @@ export default function PosPage() {
         </DialogActions>
       </Dialog>
 
+      <Dialog
+        open={orderHistoryDetailOpen}
+        onClose={() => setOrderHistoryDetailOpen(false)}
+        maxWidth="lg"
+        fullWidth
+      >
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Typography variant="body2" fontWeight={700}>
+            Chi tiết hóa đơn
+          </Typography>
+          <IconButton size="small" onClick={() => setOrderHistoryDetailOpen(false)}>
+            <CloseIcon fontSize="small" />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent>
+          {orderHistoryDetailLoading ? (
+            <Box sx={{ py: 4, display: 'flex', justifyContent: 'center' }}>
+              <CircularProgress size={24} />
+            </Box>
+          ) : orderHistoryDetail ? (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              {(() => {
+                const createdAtLabel = orderHistoryDetail?.createdAt
+                  ? new Date(orderHistoryDetail.createdAt).toLocaleString('vi-VN', { hour12: false })
+                  : '';
+
+                const customerCode = orderHistoryDetail?.customerCode || '';
+                const customerLocalId = orderHistoryDetail?.customerLocalId || '';
+                return (
+                  <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+                    <Typography variant="body2">
+                      Mã hóa đơn:{' '}
+                      <strong>{orderHistoryDetail?.orderCode || orderHistoryDetail?.localId || ''}</strong>
+                    </Typography>
+                    <Typography variant="body2">
+                      Thời gian bán: <strong>{createdAtLabel || '-'}</strong>
+                    </Typography>
+                    <Typography variant="body2">
+                      Người bán: <strong>{orderHistoryDetail?.cashierName || '-'}</strong>
+                    </Typography>
+                    <Typography variant="body2">
+                      Khách:{' '}
+                      <strong>
+                        {orderHistoryDetail?.customerName || 'Khách lẻ'}
+                      </strong>
+                      {customerCode ? (
+                        <>
+                          {' '}
+                          (
+                          <Link
+                            component="button"
+                            underline="hover"
+                            onClick={() => {
+                              if (customerLocalId) openEditCustomer(customerLocalId);
+                            }}
+                            sx={{ color: 'primary.main', fontWeight: 700 }}
+                          >
+                            {customerCode}
+                          </Link>
+                          )
+                        </>
+                      ) : null}
+                    </Typography>
+                  </Box>
+                );
+              })()}
+
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 700 }}>
+                  Hàng hóa theo hóa đơn gốc
+                </Typography>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Mã hàng</TableCell>
+                      <TableCell>Tên hàng</TableCell>
+                      <TableCell align="right">SL</TableCell>
+                      <TableCell align="right">Đơn giá</TableCell>
+                      <TableCell align="right">Thành tiền</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {(orderHistoryDetail?.invoiceLineItems || []).length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={5} align="center">
+                          Không có dữ liệu
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      orderHistoryDetail.invoiceLineItems.map((it, idx) => (
+                        <TableRow key={`${it.productLocalId || it.productCode || idx}`}>
+                          <TableCell>
+                            <Link
+                              component="button"
+                              href="#"
+                              underline="hover"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                openProductMini(it);
+                              }}
+                              sx={{ color: 'primary.main', fontWeight: 700 }}
+                            >
+                              {it.productCode || it.productLocalId || '—'}
+                            </Link>
+                          </TableCell>
+                          <TableCell>{it.productName || '—'}</TableCell>
+                          <TableCell align="right">{Number(it.qty) || 0}</TableCell>
+                          <TableCell align="right">
+                            {(Number(it.price) || 0).toLocaleString('vi-VN')}
+                          </TableCell>
+                          <TableCell align="right">
+                            {(Number(it.subtotal) || 0).toLocaleString('vi-VN')}
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
+              </Box>
+
+              <Box>
+                <Typography variant="subtitle2" sx={{ mb: 1, fontWeight: 700 }}>
+                  Các phiếu trả liên quan
+                </Typography>
+                {orderHistoryDetail.returnDetails?.length ? (
+                  orderHistoryDetail.returnDetails.map((rd, idx) => {
+                    const returnCreatedAtLabel = rd?.createdAt
+                      ? new Date(rd.createdAt).toLocaleString('vi-VN', { hour12: false })
+                      : '';
+                    const returnCode = rd?.returnCode || rd?.localId || '';
+                    return (
+                      <Box
+                        key={`${returnCode}-${idx}`}
+                        sx={{
+                          p: 1.5,
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 1,
+                          bgcolor: 'grey.50',
+                          mb: 1.5,
+                        }}
+                      >
+                        <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', mb: 1 }}>
+                          <Typography variant="body2">
+                            Mã trả:{' '}
+                            <Link
+                              component="button"
+                              href="#"
+                              underline="hover"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                openReturnDetailFromApi(returnCode);
+                              }}
+                              sx={{ color: 'primary.main', fontWeight: 700 }}
+                            >
+                              {returnCode}
+                            </Link>
+                          </Typography>
+                          <Typography variant="body2">Thời gian trả: {returnCreatedAtLabel || '-'}</Typography>
+                          <Typography variant="body2">
+                            Net: {(Number(rd?.netAmount) || 0).toLocaleString('vi-VN')} đ
+                          </Typography>
+                        </Box>
+
+                        <Typography variant="subtitle2" sx={{ mb: 0.5, fontWeight: 700 }}>
+                          Sản phẩm đã trả
+                        </Typography>
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Mã hàng</TableCell>
+                              <TableCell>Tên hàng</TableCell>
+                              <TableCell align="right">SL</TableCell>
+                              <TableCell align="right">Đơn giá</TableCell>
+                              <TableCell align="right">Thành tiền</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {(rd?.returnItems || []).length === 0 ? (
+                              <TableRow>
+                                <TableCell colSpan={5} align="center">
+                                  Không có
+                                </TableCell>
+                              </TableRow>
+                            ) : (
+                              rd.returnItems.map((it2, i2) => (
+                                <TableRow key={`${it2.productLocalId || it2.productCode || i2}`}>
+                                  <TableCell>
+                                    <Link
+                                      component="button"
+                                      href="#"
+                                      underline="hover"
+                                      onClick={(e) => {
+                                        e.preventDefault();
+                                        openProductMini(it2);
+                                      }}
+                                      sx={{ color: 'primary.main', fontWeight: 700 }}
+                                    >
+                                      {it2.productCode || it2.productLocalId || '—'}
+                                    </Link>
+                                  </TableCell>
+                                  <TableCell>{it2.productName || '—'}</TableCell>
+                                  <TableCell align="right">{Number(it2.qty) || 0}</TableCell>
+                                  <TableCell align="right">
+                                    {(Number(it2.price) || 0).toLocaleString('vi-VN')}
+                                  </TableCell>
+                                  <TableCell align="right">
+                                    {(Number(it2.subtotal) || 0).toLocaleString('vi-VN')}
+                                  </TableCell>
+                                </TableRow>
+                              ))
+                            )}
+                          </TableBody>
+                        </Table>
+                      </Box>
+                    );
+                  })
+                ) : (
+                  <Typography variant="body2" color="text.secondary">
+                    Chưa có phiếu trả liên quan
+                  </Typography>
+                )}
+              </Box>
+            </Box>
+          ) : (
+            <Typography variant="body2" color="text.secondary">
+              Không có dữ liệu chi tiết
+            </Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOrderHistoryDetailOpen(false)}>Đóng</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={productMiniOpen} onClose={() => setProductMiniOpen(false)} maxWidth="xs" fullWidth>
+        <DialogTitle>Mã hàng hóa</DialogTitle>
+        <DialogContent>
+          {productMini ? (
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.2, pt: 0.5 }}>
+              <Typography variant="body2" color="text.secondary">Mã hàng</Typography>
+              <Typography variant="body2" fontWeight={700}>
+                {productMini.productCode || productMini.productLocalId || '—'}
+              </Typography>
+              <Typography variant="body2" color="text.secondary">Tên hàng</Typography>
+              <Typography variant="body2">{productMini.productName || '—'}</Typography>
+              <Typography variant="body2" color="text.secondary">Số lượng</Typography>
+              <Typography variant="body2">{Number(productMini.qty) || 0}</Typography>
+              <Typography variant="body2" color="text.secondary">Đơn giá</Typography>
+              <Typography variant="body2">{(Number(productMini.price) || 0).toLocaleString('vi-VN')}</Typography>
+              <Typography variant="body2" color="text.secondary">Thành tiền</Typography>
+              <Typography variant="body2">{(Number(productMini.subtotal) || 0).toLocaleString('vi-VN')}</Typography>
+            </Box>
+          ) : (
+            <Typography variant="body2" color="text.secondary">Không có dữ liệu</Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setProductMiniOpen(false)}>Đóng</Button>
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={returnDetailOpen} onClose={() => setReturnDetailOpen(false)} maxWidth="md" fullWidth>
         <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           Chi tiết hóa đơn đổi trả
@@ -4416,14 +4772,21 @@ export default function PosPage() {
               </Box>
 
               {(() => {
-                const createdAt = returnDetail.createdAt ? new Date(returnDetail.createdAt) : null;
+                const createdAtTs =
+                  returnDetail?.createdAt
+                  || returnDetail?.return?.createdAt
+                  || returnDetail?.return?.createdAt;
+                const createdAt = createdAtTs ? new Date(createdAtTs) : null;
                 const createdAtLabel =
                   createdAt && !Number.isNaN(createdAt.getTime())
                     ? createdAt.toLocaleString('vi-VN', { hour12: false })
                     : '';
-                const totalReturnAmount = Number(returnDetail.totalReturnAmount) || 0;
-                const totalExchangeAmount = Number(returnDetail.totalExchangeAmount) || 0;
-                const amountDifference = Number(returnDetail.amountDifference) || 0;
+                const totalReturnAmount =
+                  Number(returnDetail?.totalReturnAmount ?? returnDetail?.return?.totalReturnAmount) || 0;
+                const totalExchangeAmount =
+                  Number(returnDetail?.totalExchangeAmount ?? returnDetail?.return?.totalExchangeAmount) || 0;
+                const amountDifference =
+                  Number(returnDetail?.amountDifference ?? returnDetail?.return?.amountDifference) || 0;
                 const diffLabel =
                   amountDifference > 0
                     ? 'Khách cần trả'
@@ -4433,21 +4796,24 @@ export default function PosPage() {
                 const diffValue = Math.abs(amountDifference);
                 const deltaBuyVsReturn = totalExchangeAmount - totalReturnAmount;
                 const cashFlowAmount =
-                  Number(returnDetail.amountPaid) || Math.abs(deltaBuyVsReturn);
+                  Number(returnDetail?.amountPaid ?? returnDetail?.return?.amountPaid) || Math.abs(deltaBuyVsReturn);
                 const paymentFlowLabel =
                   deltaBuyVsReturn > 0
                     ? 'Khách trả tiền'
                     : deltaBuyVsReturn < 0
                       ? 'Đã trả khách'
                       : 'Không chênh lệch tiền';
-                const customerName = returnDetail.customerName || returnDetail.customerLabel || '';
-                const customerPhone = returnDetail.customerPhone || '';
+                const customerName =
+                  returnDetail?.customerName || returnDetail?.customerLabel || returnDetail?.return?.customerName || '';
+                const customerPhone = returnDetail?.customerPhone || returnDetail?.return?.customerPhone || '';
+                const paymentMethod =
+                  returnDetail?.paymentMethod ?? returnDetail?.return?.paymentMethod;
                 const paymentMethodLabel =
-                  returnDetail.paymentMethod === 'cash'
+                  paymentMethod === 'cash'
                     ? 'Tiền mặt'
-                    : returnDetail.paymentMethod === 'bank'
+                    : paymentMethod === 'bank'
                       ? 'Chuyển khoản'
-                      : returnDetail.paymentMethod || '';
+                      : paymentMethod || '';
 
                 return (
                   <Box
