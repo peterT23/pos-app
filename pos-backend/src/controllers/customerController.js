@@ -349,6 +349,7 @@ async function customerLedger(req, res) {
 /** Lịch sử điểm: mua hàng (+) và trả/đổi hàng (+/−) theo thời gian */
 async function customerPointsHistory(req, res) {
   try {
+    const POINTS_PER_VND = 50000;
     const { userId, storeFilter } = await buildStoreFilter(req);
     const doc = await resolveCustomerDoc(userId, storeFilter, req.params.id);
     if (!doc) return res.status(404).json({ message: 'Không tìm thấy' });
@@ -389,7 +390,8 @@ async function customerPointsHistory(req, res) {
           code: o.orderCode || o.localId,
           type: 'Mua hàng',
           pointsDelta: pts,
-          orderTotal: o.totalAmount || 0,
+          // Hiển thị giá trị HĐ tương ứng với điểm đã cộng (tránh lệch khi order.totalAmount đã bị cập nhật sau trả một phần)
+          orderTotal: pts * POINTS_PER_VND,
         });
       }
     });
@@ -401,7 +403,8 @@ async function customerPointsHistory(req, res) {
           code: r.returnCode || r.localId,
           type: 'Trả / đổi hàng',
           pointsDelta: pd,
-          orderTotal: r.netAmount,
+          // Hiển thị giá trị HĐ tương ứng với điểm trừ/cộng (đảm bảo cùng rounding với POS)
+          orderTotal: pd * POINTS_PER_VND,
         });
       }
     });

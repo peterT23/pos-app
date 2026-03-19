@@ -1117,21 +1117,13 @@ export default function PosPage() {
       const mergedOrderDiscount = Number(orderDiscount) || 0;
       const mergedTotal = Math.max(0, mergedSubtotal - (mergedOrderDiscount || 0));
 
-      /** Điểm: + theo giá trị hàng đổi (SP cho phép tích điểm), − theo giá trị hàng trả — khớp tiền thực tế đổi/trả */
+      /** Điểm trả/đổi tính theo tiền chênh lệch thực trả: netAmount > 0 cộng điểm, netAmount < 0 trừ điểm */
       const POINTS_PER_VND = 50000;
-      const returnEligibleForPoints = itemsToReturn.reduce((sum, item) => {
-        if (item.product?.allowPoints === false) return sum;
-        return sum + (Number(item.product.price) || 0) * (Number(item.qty) || 0);
-      }, 0);
-      const exchangeEligibleForPoints = hasExchangeItems
-        ? cartItems.reduce((sum, item) => {
-            if (item.product?.allowPoints === false) return sum;
-            return sum + calculateItemFinalPrice(item) * (Number(item.qty) || 0);
-          }, 0)
-        : 0;
-      const pointsDeductedReturn = Math.floor(returnEligibleForPoints / POINTS_PER_VND);
-      const pointsAddedExchange = Math.floor(exchangeEligibleForPoints / POINTS_PER_VND);
-      const pointsDelta = pointsAddedExchange - pointsDeductedReturn;
+      const absNet = Math.abs(Number(netAmount) || 0);
+      const netPoints = Math.floor(absNet / POINTS_PER_VND);
+      const pointsDelta = netAmount >= 0 ? netPoints : -netPoints;
+      const pointsAddedExchange = pointsDelta > 0 ? pointsDelta : 0;
+      const pointsDeductedReturn = pointsDelta < 0 ? Math.abs(pointsDelta) : 0;
 
       const returnRecord = {
         localId: returnLocalId,
@@ -1179,6 +1171,14 @@ export default function PosPage() {
           await db.return_items.bulkAdd(returnItemRecords);
         }
 
+        // Tính items còn lại sau khi trả (dùng cho cả đổi hàng & trả một phần)
+        const remainingItemsForOrder = returnItems
+          .map(item => ({
+            product: item.product,
+            qty: Math.max(0, (typeof item.maxQty === 'number' ? item.maxQty : 0) - (Number(item.qty) || 0)),
+          }))
+          .filter(x => x.qty > 0);
+
         if (hasExchangeItems) {
           // Cập nhật đơn gốc: thay items bằng (hàng còn lại sau trả + hàng đổi)
           await db.order_items.where('orderLocalId').equals(returnOrder.localId).delete();
@@ -1204,11 +1204,41 @@ export default function PosPage() {
             synced: false,
           });
         } else {
-          await db.orders.update(returnOrder.localId, {
-            status: 'returned',
-            updatedAt: now,
-            synced: false,
-          });
+          // Trả hàng KHÔNG đổi: nếu trả hết -> returned; nếu trả 1 phần -> cập nhật lại HD gốc (giữ completed)
+          const returnedAll = remainingItemsForOrder.length === 0;
+          if (returnedAll) {
+            await db.order_items.where('orderLocalId').equals(returnOrder.localId).delete();
+            await db.orders.update(returnOrder.localId, {
+              status: 'returned',
+              subtotalAmount: 0,
+              totalAmount: 0,
+              updatedAt: now,
+              synced: false,
+            });
+          } else {
+            await db.order_items.where('orderLocalId').equals(returnOrder.localId).delete();
+            const remainOrderItems = remainingItemsForOrder.map(it => ({
+              orderLocalId: returnOrder.localId,
+              productLocalId: it.product.localId,
+              productName: it.product.name,
+              price: Number(it.product.price) || 0,
+              qty: Number(it.qty) || 0,
+              subtotal: (Number(it.product.price) || 0) * (Number(it.qty) || 0),
+            }));
+            if (remainOrderItems.length > 0) {
+              await db.order_items.bulkAdd(remainOrderItems);
+            }
+            const remainSubtotal = remainOrderItems.reduce((s, it) => s + (Number(it.subtotal) || 0), 0);
+            await db.orders.update(returnOrder.localId, {
+              subtotalAmount: remainSubtotal,
+              totalAmount: remainSubtotal, // giữ đơn giản: trả 1 phần không áp lại discount cũ
+              discount: 0,
+              discountType: 'vnd',
+              status: 'completed',
+              updatedAt: now,
+              synced: false,
+            });
+          }
         }
 
         for (const item of itemsToReturn) {
@@ -1317,6 +1347,17 @@ export default function PosPage() {
         customerPoints: 0,
         customerSearchTerm: '',
       });
+      // Ép clear lần nữa để tránh UI dính tên khách sau khi trả hàng
+      setTimeout(() => {
+        updateCurrentInvoice({
+          customerPhone: '',
+          customerLocalId: '',
+          customerName: '',
+          customerDebt: 0,
+          customerPoints: 0,
+          customerSearchTerm: '',
+        });
+      }, 0);
     } catch (error) {
       console.error('Lỗi khi trả hàng:', error);
       showSnackbar('Có lỗi khi lưu đơn trả hàng', 'error');
