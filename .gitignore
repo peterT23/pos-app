@@ -8,6 +8,7 @@ dist-ssr
 
 # Environment (không commit mật khẩu, API key)
 .env
+.env.example
 .env.local
 .env.*.local
 

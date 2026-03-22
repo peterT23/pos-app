@@ -17,16 +17,12 @@ Monorepo gồm **ứng dụng POS** (bán hàng tại quầy), **pos-admin** (qu
 ## Cài đặt nhanh
 
 ```bash
-# Backend
-cd pos-backend && npm install && cp .env.example .env
-# Chỉnh MONGODB_URI, JWT_SECRET, JWT_REFRESH_SECRET trong .env
-
-# POS bán hàng
-cd ../pos-app && npm install && cp .env.example .env
-
-# Admin web
-cd ../pos-admin && npm install && cp .env.example .env
+cd pos-backend && npm install
+cd ../pos-app && npm install
+cd ../pos-admin && npm install
 ```
+
+Tạo thủ công file **`.env`** trong `pos-backend/`, `pos-app/`, `pos-admin/` (theo bảng biến bên dưới). File `.env` / `.env.example` local đã được git ignore.
 
 ## Biến môi trường
 
@@ -39,9 +35,9 @@ cd ../pos-admin && npm install && cp .env.example .env
 | `JWT_SECRET` | Secret ký access token (**bắt buộc**) |
 | `JWT_REFRESH_SECRET` | Secret refresh token (**bắt buộc**) |
 | `CLIENT_ORIGIN` | Origin CORS (VD: `http://localhost:5173,http://localhost:5174`) |
+| `JWT_EXPIRES_IN` / `JWT_REFRESH_EXPIRES_IN` | Thời hạn token (mặc định `2h` / `7d`) |
+| `BODY_LIMIT` / `RATE_LIMIT_*` | Giới hạn body & rate limit (API) |
 | `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` | Dùng cho `npm run seed:admin` |
-
-Chi tiết thêm trong `pos-backend/.env.example`.
 
 ### `pos-app/.env` & `pos-admin/.env`
 
@@ -52,7 +48,7 @@ Chi tiết thêm trong `pos-backend/.env.example`.
 | `VITE_POS_APP_URL` | (Admin) Link mở POS bán hàng |
 | `VITE_POS_ADMIN_URL` | (POS app) Link mở admin |
 
-Tham khảo các file `.env.example` trong từng app.
+**pos-admin** thường cần thêm `VITE_POS_APP_URL` (ví dụ `http://localhost:5173/pos`).
 
 ## Chạy môi trường dev
 
@@ -121,4 +117,4 @@ Private — chỉ dùng nội bộ / theo thỏa thuận chủ sở hữu.
 
 ---
 
-**Lưu ý:** Không commit file `.env` chứa secret thật; chỉ dùng `.env.example` làm mẫu.
+**Lưu ý:** Không commit file `.env` chứa secret. File `.env` và `.env.example` cục bộ được đưa vào `.gitignore` — không đẩy lên GitHub.
