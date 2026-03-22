@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as XLSX from 'xlsx';
 import {
   Box,
@@ -36,6 +36,8 @@ import {
   Pagination,
   Avatar,
   Grid,
+  Alert,
+  Tooltip,
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
 import AddIcon from '@mui/icons-material/Add';
@@ -44,11 +46,20 @@ import UploadFileOutlinedIcon from '@mui/icons-material/UploadFileOutlined';
 import MoreHorizIcon from '@mui/icons-material/MoreHoriz';
 import KeyboardArrowDownIcon from '@mui/icons-material/KeyboardArrowDown';
 import KeyboardArrowUpIcon from '@mui/icons-material/KeyboardArrowUp';
+import CloseIcon from '@mui/icons-material/Close';
+import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import Layout from '../components/Layout';
-import { apiRequest } from '../utils/apiClient';
+import { apiRequest, apiRequestFormData, downloadBlob } from '../utils/apiClient';
 
 function formatMoney(n) {
   return (Number(n) || 0).toLocaleString('vi-VN');
+}
+
+/** Điểm thưởng — số nguyên, không định dạng tiền */
+function formatPoints(n) {
+  const x = Number(n);
+  if (Number.isNaN(x)) return '0';
+  return Math.round(x).toLocaleString('vi-VN');
 }
 
 function formatDT(ts) {
@@ -109,13 +120,13 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
     if (!id) return;
     if (tab === 'sales' && !cache.orders) loadSlice('orders');
     if (tab === 'debt' && !cache.ledger) loadSlice('ledger');
-    if (tab === 'points' && !cache.points) loadSlice('points');
-  }, [id, tab, cache.orders, cache.ledger, cache.points, loadSlice]);
+    if (tab === 'points' && !cache.pointsHistory) loadSlice('points');
+  }, [id, tab, cache.orders, cache.ledger, cache.pointsHistory, loadSlice]);
 
   const orders = cache.orders || [];
   const returns = cache.returns || [];
   const ledger = cache.ledger || [];
-  const points = cache.points || [];
+  const pointsHistoryRows = cache.pointsHistory || [];
   const loading = cache.loading;
 
   const orderView = salesDetail?.type === 'order' ? salesDetail.data : null;
@@ -259,13 +270,20 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
             <Grid size={{ xs: 12, md: 9 }}>
               <Grid container spacing={2}>
                 {[
+                  ['Loại khách', customer.customerType],
                   ['Điện thoại', customer.phone],
                   ['Email', customer.email],
                   ['Địa chỉ', customer.address],
-                  ['Khu vực', [customer.ward, customer.area].filter(Boolean).join(', ') || '—'],
+                  ['Khu vực giao hàng', customer.area],
+                  ['Phường/Xã', customer.ward],
+                  ['Công ty', customer.company],
+                  ['Mã số thuế', customer.taxId],
+                  ['CMND/CCCD', customer.citizenId],
                   ['Ngày sinh', customer.dateOfBirth],
                   ['Giới tính', customer.gender],
                   ['Facebook', customer.facebook],
+                  ['Ngày giao dịch cuối', customer.lastTransactionAt ? formatDT(customer.lastTransactionAt) : ''],
+                  ['Trạng thái', customer.status === 'inactive' ? 'Ngừng' : 'Đang hoạt động'],
                 ].map(([k, v]) => (
                   <Grid size={{ xs: 12, sm: 6 }} key={k}>
                     <Typography variant="caption" color="text.secondary">
@@ -283,7 +301,7 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
               </Paper>
               <Box sx={{ mt: 2, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                 <Typography variant="body2">
-                  <strong>Điểm hiện tại:</strong> {formatMoney(customer.points)}
+                  <strong>Điểm hiện tại:</strong> {formatPoints(customer.points)}
                 </Typography>
                 <Typography variant="body2">
                   <strong>Nợ hiện tại:</strong> {formatMoney(customer.debt)} đ
@@ -485,14 +503,14 @@ function CustomerDetailExpand({ customer, tab, onTabChange, cache, loadSlice }) 
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {points.length === 0 ? (
+                  {pointsHistoryRows.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={6} align="center" sx={{ py: 4 }}>
                         Chưa có lịch sử tích điểm từ hóa đơn
                       </TableCell>
                     </TableRow>
                   ) : (
-                    points.map((row, i) => (
+                    pointsHistoryRows.map((row, i) => (
                       <TableRow key={`${row.code}-${i}`}>
                         <TableCell>{row.code}</TableCell>
                         <TableCell>{formatDT(row.time)}</TableCell>
@@ -994,6 +1012,24 @@ export default function CustomersPage() {
   const [createForm, setCreateForm] = useState({ name: '', phone: '', customerCode: '', address: '', group: '' });
   const [saving, setSaving] = useState(false);
 
+  const [importOpen, setImportOpen] = useState(false);
+  const [importUpdateDebt, setImportUpdateDebt] = useState(true);
+  const [importUpdatePoints, setImportUpdatePoints] = useState(true);
+  const [importAllowDupEmail, setImportAllowDupEmail] = useState(false);
+  /** Không tích = bỏ qua dòng trùng email/SĐT (trừ khi khớp theo mã KH) */
+  const [importUpdateOnDupEmail, setImportUpdateOnDupEmail] = useState(false);
+  const [importUpdateOnDupPhone, setImportUpdateOnDupPhone] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  /** Đang đọc/kiểm tra file Excel cục bộ (chưa gửi server) */
+  const [importValidating, setImportValidating] = useState(false);
+  const [importResult, setImportResult] = useState(null);
+  /** File đã chọn và hợp lệ — chỉ gửi server khi bấm Thực hiện */
+  const [importPendingFile, setImportPendingFile] = useState(null);
+  /** Lỗi kiểm tra file (trước khi import) */
+  const [importFileError, setImportFileError] = useState(null);
+  const importFileRef = useRef(null);
+  const importAbortRef = useRef(null);
+
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 400);
     return () => clearTimeout(t);
@@ -1049,7 +1085,7 @@ export default function CustomersPage() {
         orders: null,
         returns: null,
         ledger: null,
-        points: null,
+        pointsHistory: null,
         loading: null,
       },
     }));
@@ -1080,10 +1116,10 @@ export default function CustomersPage() {
             [id]: { ...prev[id], ledger, loading: null },
           }));
         } else if (slice === 'points') {
-          const points = await apiRequest(`/api/customers/${id}/points-history`);
+          const pointsHistory = await apiRequest(`/api/customers/${id}/points-history`);
           setDetailCache((prev) => ({
             ...prev,
-            [id]: { ...prev[id], points, loading: null },
+            [id]: { ...prev[id], pointsHistory, loading: null },
           }));
         }
       } catch {
@@ -1098,7 +1134,17 @@ export default function CustomersPage() {
 
   const mergedCustomer = (row) => {
     const c = detailCache[row._id];
-    return c ? { ...row, ...c, totalSales: row.totalSales, netSales: row.netSales } : row;
+    if (!c) return row;
+    // Cache có orders/ledger/pointsHistory — không ghi đè điểm/nợ/tổng bán từ danh sách API
+    return {
+      ...row,
+      ...c,
+      totalSales: row.totalSales,
+      netSales: row.netSales,
+      totalReturns: row.totalReturns,
+      debt: row.debt,
+      points: row.points,
+    };
   };
 
   const exportExcel = () => {
@@ -1133,8 +1179,175 @@ export default function CustomersPage() {
     }
   };
 
+  const handleDownloadImportTemplate = async () => {
+    try {
+      const blob = await downloadBlob('/api/customers/import/template');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'MauFileKhachHang.xlsx';
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setImportResult({ error: e.message || 'Không tải được file mẫu' });
+    }
+  };
+
+  const validateImportFileSync = (file) => {
+    const name = (file.name || '').toLowerCase();
+    if (!/\.(xlsx|xls)$/.test(name)) {
+      return 'Chỉ chấp nhận file .xlsx hoặc .xls';
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      return 'File quá lớn (tối đa 15MB)';
+    }
+    return null;
+  };
+
+  const validateImportFileAsync = (file) => new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = new Uint8Array(ev.target.result);
+        const wb = XLSX.read(data, { type: 'array' });
+        const sheetName = wb.SheetNames.includes('CustomerTemplate')
+          ? 'CustomerTemplate'
+          : wb.SheetNames[0];
+        if (!sheetName) {
+          resolve('File không có sheet dữ liệu');
+          return;
+        }
+        const sheet = wb.Sheets[sheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+        if (!rows.length) {
+          resolve('File không có dòng tiêu đề');
+          return;
+        }
+        const headerRow = rows[0].map((c) => String(c || '').trim().toLowerCase());
+        const hasCode = headerRow.some((h) => h === 'mã khách hàng');
+        const hasName = headerRow.some((h) => h === 'tên khách hàng');
+        if (!hasCode && !hasName) {
+          resolve('Không nhận diện được cột "Mã khách hàng" hoặc "Tên khách hàng". Hãy dùng file mẫu từ hệ thống.');
+          return;
+        }
+        resolve(null);
+      } catch (err) {
+        resolve(`Không đọc được file Excel: ${err.message || 'lỗi'}`);
+      }
+    };
+    reader.onerror = () => resolve('Không đọc được file từ máy');
+    reader.readAsArrayBuffer(file);
+  });
+
+  const handleImportFileSelected = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    setImportPendingFile(null);
+    setImportFileError(null);
+    setImportResult(null);
+    if (!file) return;
+
+    const syncErr = validateImportFileSync(file);
+    if (syncErr) {
+      setImportFileError(syncErr);
+      return;
+    }
+
+    setImportValidating(true);
+    const asyncErr = await validateImportFileAsync(file);
+    setImportValidating(false);
+    if (asyncErr) {
+      setImportFileError(asyncErr);
+      return;
+    }
+    setImportPendingFile(file);
+  };
+
+  const clearImportPendingFile = () => {
+    setImportPendingFile(null);
+    setImportFileError(null);
+  };
+
+  const handleImportStop = () => {
+    importAbortRef.current?.abort();
+  };
+
+  const handleImportExecute = async () => {
+    if (!importPendingFile) return;
+    importAbortRef.current?.abort();
+    const ac = new AbortController();
+    importAbortRef.current = ac;
+    setImportBusy(true);
+    setImportResult(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', importPendingFile);
+      fd.append('updateDebt', String(importUpdateDebt));
+      fd.append('updatePoints', String(importUpdatePoints));
+      fd.append('allowDuplicateEmail', String(importAllowDupEmail));
+      fd.append('updateOnDuplicateEmail', String(importUpdateOnDupEmail));
+      fd.append('updateOnDuplicatePhone', String(importUpdateOnDupPhone));
+      const data = await apiRequestFormData('/api/customers/import', {
+        method: 'POST',
+        body: fd,
+        signal: ac.signal,
+      });
+      setImportResult(data);
+      if (!data.cancelled) setImportPendingFile(null);
+      load();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        setImportResult({
+          cancelled: true,
+          message: 'Đã gửi yêu cầu dừng. Dữ liệu đã ghi trước đó vẫn được giữ; phần chưa xử lý có thể bỏ qua.',
+        });
+      } else {
+        setImportResult({ error: err.message || 'Import thất bại', errors: err.data?.errors });
+      }
+    } finally {
+      importAbortRef.current = null;
+      setImportBusy(false);
+    }
+  };
+
+  const openImportDialog = () => {
+    setImportOpen(true);
+    setImportResult(null);
+    setImportPendingFile(null);
+    setImportFileError(null);
+    setImportValidating(false);
+  };
+
+  const closeImportDialog = () => {
+    if (importValidating) return;
+    if (importBusy) {
+      importAbortRef.current?.abort();
+      setImportBusy(false);
+    }
+    setImportOpen(false);
+    setImportPendingFile(null);
+    setImportFileError(null);
+    setImportResult(null);
+    setImportValidating(false);
+    importAbortRef.current = null;
+  };
+
   const allIds = items.map((r) => r._id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selected[id]);
+
+  /** Thông báo đỏ dưới hàng chọn file (sau khi import có dòng trùng) */
+  const importDuplicateSummaryLine = useMemo(() => {
+    if (!importResult) return null;
+    const nEmail = Number(importResult.skippedDuplicateEmail) || 0;
+    const nPhone = Number(importResult.skippedDuplicatePhone) || 0;
+    const total = nEmail + nPhone;
+    if (total <= 0) return null;
+    if (nEmail > 0 && nPhone > 0) {
+      return `Có ${total} dòng khách hàng bị trùng email hoặc số điện thoại (gồm ${nEmail} trùng email, ${nPhone} trùng số điện thoại).`;
+    }
+    if (nEmail > 0) return `Có ${nEmail} dòng khách hàng bị trùng email.`;
+    return `Có ${nPhone} dòng khách hàng bị trùng số điện thoại.`;
+  }, [importResult]);
 
   return (
     <Layout maxWidth={false}>
@@ -1219,7 +1432,7 @@ export default function CustomersPage() {
               <Button variant="contained" startIcon={<AddIcon />} onClick={() => setCreateOpen(true)}>
                 Khách hàng
               </Button>
-              <Button variant="outlined" startIcon={<UploadFileOutlinedIcon />} disabled>
+              <Button variant="outlined" startIcon={<UploadFileOutlinedIcon />} onClick={openImportDialog}>
                 Import file
               </Button>
               <Button variant="outlined" startIcon={<FileDownloadOutlinedIcon />} onClick={exportExcel}>
@@ -1257,6 +1470,7 @@ export default function CustomersPage() {
                   <TableCell>Tên khách hàng</TableCell>
                   <TableCell>Điện thoại</TableCell>
                   <TableCell align="right">Nợ hiện tại</TableCell>
+                  <TableCell align="right">Điểm hiện tại</TableCell>
                   <TableCell align="right">Tổng bán</TableCell>
                   <TableCell align="right">Tổng bán trừ trả hàng</TableCell>
                 </TableRow>
@@ -1271,6 +1485,9 @@ export default function CustomersPage() {
                     <Typography variant="caption" fontWeight={700}>{formatMoney(summary.pageSumDebt)}</Typography>
                   </TableCell>
                   <TableCell align="right">
+                    <Typography variant="caption" fontWeight={700}>{formatPoints(summary.pageSumPoints)}</Typography>
+                  </TableCell>
+                  <TableCell align="right">
                     <Typography variant="caption" fontWeight={700}>{formatMoney(summary.pageSumSales)}</Typography>
                   </TableCell>
                   <TableCell align="right">
@@ -1281,13 +1498,13 @@ export default function CustomersPage() {
               <TableBody>
                 {loading ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center" sx={{ py: 6 }}>
+                    <TableCell colSpan={9} align="center" sx={{ py: 6 }}>
                       <CircularProgress size={36} />
                     </TableCell>
                   </TableRow>
                 ) : items.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} align="center" sx={{ py: 6 }}>
+                    <TableCell colSpan={9} align="center" sx={{ py: 6 }}>
                       Không có khách hàng
                     </TableCell>
                   </TableRow>
@@ -1321,11 +1538,12 @@ export default function CustomersPage() {
                           <TableCell>{row.name || '—'}</TableCell>
                           <TableCell>{row.phone || '—'}</TableCell>
                           <TableCell align="right">{formatMoney(row.debt)}</TableCell>
+                          <TableCell align="right">{formatPoints(row.points)}</TableCell>
                           <TableCell align="right">{formatMoney(row.totalSales)}</TableCell>
                           <TableCell align="right">{formatMoney(row.netSales)}</TableCell>
                         </TableRow>
                         <TableRow>
-                          <TableCell colSpan={8} sx={{ py: 0, borderBottom: open ? undefined : 'none', borderTop: 'none' }}>
+                          <TableCell colSpan={9} sx={{ py: 0, borderBottom: open ? undefined : 'none', borderTop: 'none' }}>
                             <Collapse in={open} timeout="auto" unmountOnExit>
                               <CustomerDetailExpand
                                 customer={mergedCustomer(row)}
@@ -1359,6 +1577,204 @@ export default function CustomersPage() {
           </Box>
         </Box>
       </Box>
+
+      <Dialog open={importOpen} onClose={closeImportDialog} maxWidth="sm" fullWidth>
+        <DialogTitle sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', pr: 1 }}>
+          Nhập khách hàng từ file excel
+          <IconButton aria-label="đóng" onClick={closeImportDialog} size="small" disabled={importValidating}>
+            <CloseIcon />
+          </IconButton>
+        </DialogTitle>
+        <DialogContent>
+          <input
+            ref={importFileRef}
+            type="file"
+            accept=".xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            style={{ display: 'none' }}
+            onChange={handleImportFileSelected}
+          />
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            (Tải về file mẫu:{' '}
+            <Link component="button" type="button" variant="body2" onClick={handleDownloadImportTemplate} sx={{ verticalAlign: 'baseline' }}>
+              Excel
+            </Link>
+            )
+          </Typography>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5, mb: 2 }}>
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={importUpdateDebt}
+                  onChange={(_, v) => setImportUpdateDebt(v)}
+                  disabled={importBusy || importValidating}
+                />
+              )}
+              label={(
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  Cập nhật dư nợ cuối
+                  <Tooltip title="Đánh dấu: khi khách đã tồn tại, ghi đè nợ từ file. Bỏ đánh dấu: giữ nguyên nợ hiện tại trên hệ thống.">
+                    <InfoOutlinedIcon sx={{ fontSize: 18, color: 'action.active' }} />
+                  </Tooltip>
+                </Box>
+              )}
+            />
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={importUpdatePoints}
+                  onChange={(_, v) => setImportUpdatePoints(v)}
+                  disabled={importBusy || importValidating}
+                />
+              )}
+              label={(
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  Cập nhật tích điểm
+                  <Tooltip title="Đánh dấu: khi khách đã tồn tại, ghi đè điểm từ file. Bỏ đánh dấu: giữ nguyên điểm hiện tại.">
+                    <InfoOutlinedIcon sx={{ fontSize: 18, color: 'action.active' }} />
+                  </Tooltip>
+                </Box>
+              )}
+            />
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={importAllowDupEmail}
+                  onChange={(_, v) => setImportAllowDupEmail(v)}
+                  disabled={importBusy || importValidating}
+                />
+              )}
+              label={(
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  Cho phép khách hàng trùng email
+                  <Tooltip title="Đánh dấu: cho phép nhiều khách dùng chung một email. Bỏ đánh dấu: bỏ qua dòng nếu email đã được khách khác sử dụng.">
+                    <InfoOutlinedIcon sx={{ fontSize: 18, color: 'action.active' }} />
+                  </Tooltip>
+                </Box>
+              )}
+            />
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={importUpdateOnDupEmail}
+                  onChange={(_, v) => setImportUpdateOnDupEmail(v)}
+                  disabled={importBusy || importValidating}
+                />
+              )}
+              label={(
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  Cập nhật khi trùng email (đã có trong hệ thống)
+                  <Tooltip title="Khớp theo mã KH luôn được cập nhật. Chỉ áp dụng khi file khớp khách cũ theo email (không có/không trùng mã). Bỏ đánh dấu: bỏ qua dòng, không ghi đè.">
+                    <InfoOutlinedIcon sx={{ fontSize: 18, color: 'action.active' }} />
+                  </Tooltip>
+                </Box>
+              )}
+            />
+            <FormControlLabel
+              control={(
+                <Checkbox
+                  checked={importUpdateOnDupPhone}
+                  onChange={(_, v) => setImportUpdateOnDupPhone(v)}
+                  disabled={importBusy || importValidating}
+                />
+              )}
+              label={(
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                  Cập nhật khi trùng số điện thoại
+                  <Tooltip title="Khớp theo mã KH luôn được cập nhật. Chỉ áp dụng khi khớp khách cũ theo SĐT. Bỏ đánh dấu: bỏ qua dòng, không ghi đè.">
+                    <InfoOutlinedIcon sx={{ fontSize: 18, color: 'action.active' }} />
+                  </Tooltip>
+                </Box>
+              )}
+            />
+          </Box>
+
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1, mb: 1 }}>
+            <Button
+              variant="contained"
+              disabled={importBusy || importValidating}
+              onClick={() => importFileRef.current?.click()}
+            >
+              {importValidating ? 'Đang kiểm tra…' : 'Chọn file dữ liệu'}
+            </Button>
+            {importPendingFile && (
+              <Chip
+                label={importPendingFile.name}
+                color="primary"
+                variant="outlined"
+                onDelete={importBusy || importValidating ? undefined : clearImportPendingFile}
+                sx={{ maxWidth: '100%' }}
+              />
+            )}
+          </Box>
+
+          {importDuplicateSummaryLine && (
+            <Box
+              sx={{
+                borderTop: '2px solid',
+                borderColor: 'error.main',
+                pt: 1.5,
+                mt: 1,
+                mb: 2,
+              }}
+            >
+              <Typography variant="body2" sx={{ color: 'error.main', fontWeight: 700 }}>
+                {importDuplicateSummaryLine}
+              </Typography>
+            </Box>
+          )}
+
+          {importFileError && (
+            <Alert severity="warning" sx={{ mb: 2 }}>{importFileError}</Alert>
+          )}
+          {importResult?.error && (
+            <Alert severity="error" sx={{ mb: 2 }}>{importResult.error}</Alert>
+          )}
+          {importResult?.cancelled && (
+            <Alert severity="warning" sx={{ mb: 2 }}>
+              {importResult.message || 'Đã dừng import.'}
+              {importResult.created !== undefined && (
+                <Typography variant="body2" sx={{ mt: 1 }}>
+                  Tạo {importResult.created}, cập nhật {importResult.updated}, bỏ qua {importResult.skipped}.
+                </Typography>
+              )}
+            </Alert>
+          )}
+          {importResult && !importResult.error && !importResult.cancelled && importResult.message && (
+            <Alert severity={importResult.ok === false ? 'warning' : 'success'} sx={{ mb: 2 }}>
+              {importResult.message}
+              {Array.isArray(importResult.errors) && importResult.errors.length > 0 && (
+                <Box component="ul" sx={{ mt: 1, mb: 0, pl: 2 }}>
+                  {importResult.errors.slice(0, 10).map((er) => (
+                    <li key={`${er.row}-${er.message}`}>
+                      <Typography variant="caption">Dòng {er.row}: {er.message}</Typography>
+                    </li>
+                  ))}
+                  {importResult.errors.length > 10 && (
+                    <Typography variant="caption">… và {importResult.errors.length - 10} lỗi khác</Typography>
+                  )}
+                </Box>
+              )}
+            </Alert>
+          )}
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, pt: 0, justifyContent: 'space-between', flexWrap: 'wrap', gap: 1 }}>
+          <Button
+            variant="outlined"
+            color="warning"
+            disabled={!importBusy}
+            onClick={handleImportStop}
+          >
+            Dừng cập nhật
+          </Button>
+          <Button
+            variant="contained"
+            disabled={importBusy || importValidating || !importPendingFile || !!importFileError}
+            onClick={handleImportExecute}
+          >
+            {importBusy ? 'Đang xử lý…' : 'Thực hiện'}
+          </Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={createOpen} onClose={() => setCreateOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>Thêm khách hàng</DialogTitle>

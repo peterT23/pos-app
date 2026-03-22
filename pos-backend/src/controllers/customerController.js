@@ -25,74 +25,120 @@ async function buildStoreFilter(req) {
   return { userId, role, storeFilter };
 }
 
-function facetSalesReturns(userId, storeFilter) {
-  const base = { userId, ...storeFilter };
-  return [
-    { $match: { ...base, status: 'completed' } },
-    {
-      $facet: {
-        salesByLocal: [
-          { $match: { customerLocalId: { $nin: [null, ''] } } },
-          { $group: { _id: '$customerLocalId', total: { $sum: '$totalAmount' } } },
-        ],
-        salesByPhone: [
-          {
-            $match: {
-              $or: [{ customerLocalId: null }, { customerLocalId: '' }],
-              customerPhone: { $nin: [null, ''] },
-            },
-          },
-          { $group: { _id: '$customerPhone', total: { $sum: '$totalAmount' } } },
-        ],
-      },
-    },
-  ];
-}
-
-function facetReturns(userId, storeFilter) {
-  const base = { userId, ...storeFilter };
-  return [
-    { $match: base },
-    {
-      $facet: {
-        retByLocal: [
-          { $match: { customerLocalId: { $nin: [null, ''] } } },
-          { $group: { _id: '$customerLocalId', total: { $sum: '$totalReturnAmount' } } },
-        ],
-        retByPhone: [
-          {
-            $match: {
-              $or: [{ customerLocalId: null }, { customerLocalId: '' }],
-              customerPhone: { $nin: [null, ''] },
-            },
-          },
-          { $group: { _id: '$customerPhone', total: { $sum: '$totalReturnAmount' } } },
-        ],
-      },
-    },
-  ];
-}
-
-function mapsFromFacet(rows) {
-  const m = {};
-  (rows || []).forEach((r) => {
-    if (r._id) m[String(r._id)] = r.total || 0;
-  });
-  return m;
-}
-
-function attachTotals(c, salesL, salesP, retL, retP) {
-  let totalSales = salesL[c.localId] || 0;
-  let totalReturns = retL[c.localId] || 0;
-  if (!totalSales && c.phone) {
-    totalSales = salesP[c.phone] || 0;
-    totalReturns = retP[c.phone] || 0;
+/**
+ * Tiền trả theo từng hóa đơn (gắn orderLocalId hoặc orderCode).
+ * Mỗi phiếu trả chỉ cộng vào một key để tránh trùng.
+ */
+function buildReturnSumByOrderKey(returns) {
+  const map = new Map();
+  for (const r of returns) {
+    const amt = Number(r.totalReturnAmount) || 0;
+    if (r.orderLocalId) {
+      const k = `L:${String(r.orderLocalId)}`;
+      map.set(k, (map.get(k) || 0) + amt);
+    } else if (r.orderCode) {
+      const k = `C:${String(r.orderCode)}`;
+      map.set(k, (map.get(k) || 0) + amt);
+    }
   }
+  return map;
+}
+
+function getReturnSumForOrder(order, returnSumByOrderKey) {
+  if (order.localId && returnSumByOrderKey.has(`L:${String(order.localId)}`)) {
+    return returnSumByOrderKey.get(`L:${String(order.localId)}`) || 0;
+  }
+  if (order.orderCode && returnSumByOrderKey.has(`C:${String(order.orderCode)}`)) {
+    return returnSumByOrderKey.get(`C:${String(order.orderCode)}`) || 0;
+  }
+  return 0;
+}
+
+/** Gộp doanh số gốc (gross) và sau trả (net) theo khách — theo customerLocalId hoặc customerPhone trên HĐ */
+function accumulateOrderSalesByCustomer(orders, returnSumByOrderKey) {
+  const grossByLocal = new Map();
+  const netByLocal = new Map();
+  const grossByPhone = new Map();
+  const netByPhone = new Map();
+
+  for (const o of orders) {
+    const ret = getReturnSumForOrder(o, returnSumByOrderKey);
+    const net = Number(o.totalAmount) || 0;
+    const gross = net + ret;
+    if (o.customerLocalId) {
+      const id = String(o.customerLocalId);
+      grossByLocal.set(id, (grossByLocal.get(id) || 0) + gross);
+      netByLocal.set(id, (netByLocal.get(id) || 0) + net);
+    } else if (o.customerPhone) {
+      const ph = String(o.customerPhone);
+      grossByPhone.set(ph, (grossByPhone.get(ph) || 0) + gross);
+      netByPhone.set(ph, (netByPhone.get(ph) || 0) + net);
+    }
+  }
+  return { grossByLocal, netByLocal, grossByPhone, netByPhone };
+}
+
+function accumulateReturnTotalsByCustomer(returns) {
+  const retByLocal = new Map();
+  const retByPhone = new Map();
+  for (const r of returns) {
+    const amt = Number(r.totalReturnAmount) || 0;
+    if (r.customerLocalId) {
+      const id = String(r.customerLocalId);
+      retByLocal.set(id, (retByLocal.get(id) || 0) + amt);
+    } else if (r.customerPhone) {
+      const ph = String(r.customerPhone);
+      retByPhone.set(ph, (retByPhone.get(ph) || 0) + amt);
+    }
+  }
+  return { retByLocal, retByPhone };
+}
+
+async function loadCustomerSalesMetrics(userId, storeFilter) {
+  const orderQuery = { userId, status: 'completed', ...storeFilter };
+  const returnQuery = { userId, ...storeFilter };
+  const [orders, returns] = await Promise.all([
+    Order.find(orderQuery).lean(),
+    Return.find(returnQuery).lean(),
+  ]);
+  const returnSumByOrderKey = buildReturnSumByOrderKey(returns);
+  const { grossByLocal, netByLocal, grossByPhone, netByPhone } = accumulateOrderSalesByCustomer(
+    orders,
+    returnSumByOrderKey,
+  );
+  const { retByLocal, retByPhone } = accumulateReturnTotalsByCustomer(returns);
+  return {
+    grossByLocal,
+    netByLocal,
+    grossByPhone,
+    netByPhone,
+    retByLocal,
+    retByPhone,
+  };
+}
+
+/**
+ * totalSales: tổng bán gốc (tiền HĐ hiện tại + tiền đã trả gắn các HĐ của khách)
+ * netSales: tổng bán sau trả (= tổng Order.totalAmount hiện tại)
+ * totalReturns: tổng phiếu trả theo khách (tham khảo)
+ */
+function attachTotals(c, metrics) {
+  const {
+    grossByLocal, netByLocal, grossByPhone, netByPhone, retByLocal, retByPhone,
+  } = metrics;
+  const gid = String(c.localId);
+  const phone = c.phone ? String(c.phone) : '';
+  const totalSales =
+    (grossByLocal.get(gid) || 0) + (phone ? (grossByPhone.get(phone) || 0) : 0);
+  const netSales =
+    (netByLocal.get(gid) || 0) + (phone ? (netByPhone.get(phone) || 0) : 0);
+  const totalReturns =
+    (retByLocal.get(gid) || 0) + (phone ? (retByPhone.get(phone) || 0) : 0);
   return {
     ...c,
     totalSales,
     totalReturns,
-    netSales: Math.max(0, (totalSales || 0) - (totalReturns || 0)),
+    netSales,
   };
 }
 
@@ -171,23 +217,17 @@ async function listCustomers(req, res) {
     const take = Math.min(Math.max(Number(limit) || 15, 1), 100);
     const skip = (Math.max(Number(page) || 1, 1) - 1) * take;
 
-    const [total, rows, salesAgg, retAgg, totalsAgg] = await Promise.all([
+    const [total, rows, totalsAgg, salesMetrics] = await Promise.all([
       Customer.countDocuments(filter),
       Customer.find(filter).sort({ createdAt: -1 }).skip(skip).limit(take).lean(),
-      Order.aggregate(facetSalesReturns(effectiveUserId, storeFilter)),
-      Return.aggregate(facetReturns(effectiveUserId, storeFilter)),
       Customer.aggregate([
         { $match: filter },
         { $group: { _id: null, sumDebt: { $sum: '$debt' }, sumPoints: { $sum: '$points' } } },
       ]),
+      loadCustomerSalesMetrics(effectiveUserId, storeFilter),
     ]);
 
-    const salesL = mapsFromFacet(salesAgg[0]?.salesByLocal);
-    const salesP = mapsFromFacet(salesAgg[0]?.salesByPhone);
-    const retL = mapsFromFacet(retAgg[0]?.retByLocal);
-    const retP = mapsFromFacet(retAgg[0]?.retByPhone);
-
-    const items = rows.map((c) => attachTotals(c, salesL, salesP, retL, retP));
+    const items = rows.map((c) => attachTotals(c, salesMetrics));
 
     const t = totalsAgg[0] || {};
     res.json({
@@ -199,6 +239,7 @@ async function listCustomers(req, res) {
         sumDebt: t.sumDebt || 0,
         sumPoints: t.sumPoints || 0,
         pageSumDebt: items.reduce((s, c) => s + (Number(c.debt) || 0), 0),
+        pageSumPoints: items.reduce((s, c) => s + (Number(c.points) || 0), 0),
         pageSumSales: items.reduce((s, c) => s + (Number(c.totalSales) || 0), 0),
         pageSumNet: items.reduce((s, c) => s + (Number(c.netSales) || 0), 0),
       },
@@ -216,15 +257,8 @@ async function getCustomer(req, res) {
     const doc = await resolveCustomerDoc(userId, storeFilter, req.params.id);
     if (!doc) return res.status(404).json({ message: 'Không tìm thấy khách hàng' });
 
-    const [salesAgg, retAgg] = await Promise.all([
-      Order.aggregate(facetSalesReturns(doc.userId, { storeId: doc.storeId })),
-      Return.aggregate(facetReturns(doc.userId, { storeId: doc.storeId })),
-    ]);
-    const salesL = mapsFromFacet(salesAgg[0]?.salesByLocal);
-    const salesP = mapsFromFacet(salesAgg[0]?.salesByPhone);
-    const retL = mapsFromFacet(retAgg[0]?.retByLocal);
-    const retP = mapsFromFacet(retAgg[0]?.retByPhone);
-    const enriched = attachTotals(doc, salesL, salesP, retL, retP);
+    const salesMetrics = await loadCustomerSalesMetrics(doc.userId, { storeId: doc.storeId });
+    const enriched = attachTotals(doc, salesMetrics);
     res.json(enriched);
   } catch (e) {
     // eslint-disable-next-line no-console
@@ -456,8 +490,15 @@ async function createCustomer(req, res) {
       note: body.note || '',
       gender: body.gender || '',
       dateOfBirth: body.dateOfBirth || '',
-      points: 0,
-      debt: 0,
+      customerType: body.customerType || '',
+      company: body.company || '',
+      taxId: body.taxId || '',
+      citizenId: body.citizenId || '',
+      facebook: body.facebook || '',
+      lastTransactionAt: body.lastTransactionAt != null ? Number(body.lastTransactionAt) : null,
+      status: body.status || 'active',
+      points: Number(body.points) || 0,
+      debt: Number(body.debt) || 0,
       createdAt: now,
       updatedAt: now,
     });
@@ -476,7 +517,11 @@ async function updateCustomer(req, res) {
     const doc = await resolveCustomerDoc(userId, storeFilter, req.params.id);
     if (!doc) return res.status(404).json({ message: 'Không tìm thấy' });
 
-    const allowed = ['name', 'phone', 'customerCode', 'address', 'area', 'ward', 'group', 'email', 'note', 'gender', 'dateOfBirth', 'facebook', 'nickname', 'points', 'debt'];
+    const allowed = [
+      'name', 'phone', 'customerCode', 'address', 'area', 'ward', 'group', 'email', 'note',
+      'gender', 'dateOfBirth', 'facebook', 'nickname', 'points', 'debt',
+      'customerType', 'company', 'taxId', 'citizenId', 'lastTransactionAt', 'status',
+    ];
     const patch = {};
     allowed.forEach((k) => {
       if (req.body[k] !== undefined) patch[k] = req.body[k];
@@ -493,6 +538,7 @@ async function updateCustomer(req, res) {
 }
 
 module.exports = {
+  buildStoreFilter,
   listCustomers,
   getCustomer,
   customerOrders,

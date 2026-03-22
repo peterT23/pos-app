@@ -59,22 +59,24 @@ export async function apiRequest(path, options = {}, retry = true) {
   return data;
 }
 
-/** Gửi FormData (file upload) với auth. options.body nên là FormData; không set Content-Type. */
+/** Gửi FormData (file upload) với auth. options.body nên là FormData; không set Content-Type. Hỗ trợ `signal` (AbortController). */
 export async function apiRequestFormData(path, options = {}) {
+  const { signal, ...rest } = options;
   const token = getStoredToken();
   const storeId = getStoredStoreId() || DEFAULT_STORE_ID;
-  const headers = { ...(options.headers || {}) };
+  const headers = { ...(rest.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (storeId) headers['X-Store-Id'] = storeId;
   headers['X-Client-App'] = CLIENT_APP;
-  if (options.body instanceof FormData) {
+  if (rest.body instanceof FormData) {
     // Do NOT set Content-Type so browser sets multipart boundary
   } else {
     headers['Content-Type'] = 'application/json';
   }
 
   const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
+    ...rest,
+    signal,
     headers,
     credentials: 'include',
   });
@@ -88,6 +90,28 @@ export async function apiRequestFormData(path, options = {}) {
     throw err;
   }
   return data;
+}
+
+/** Tải file (blob) có kèm token — dùng cho file mẫu Excel, v.v. */
+export async function downloadBlob(path) {
+  const token = getStoredToken();
+  const storeId = getStoredStoreId() || DEFAULT_STORE_ID;
+  const headers = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (storeId) headers['X-Store-Id'] = storeId;
+  headers['X-Client-App'] = CLIENT_APP;
+
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    credentials: 'include',
+    headers,
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    const err = new Error(data.message || 'Tải file thất bại');
+    err.status = response.status;
+    throw err;
+  }
+  return response.blob();
 }
 
 /** Gọi refresh session. Trả về null khi lỗi mạng hoặc backend không chạy (không ném lỗi). */

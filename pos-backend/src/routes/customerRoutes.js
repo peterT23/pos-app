@@ -10,8 +10,16 @@ const {
   createCustomer,
   updateCustomer,
 } = require('../controllers/customerController');
+const {
+  upload,
+  downloadCustomerTemplate,
+  importCustomers,
+} = require('../controllers/customerImportController');
 
 const router = express.Router();
+
+router.get('/import/template', authRequired, downloadCustomerTemplate);
+router.post('/import', authRequired, upload.single('file'), importCustomers);
 
 router.get('/', authRequired, listCustomers);
 router.post('/', authRequired, createCustomer);

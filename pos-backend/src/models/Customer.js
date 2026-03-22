@@ -20,6 +20,15 @@ const customerSchema = new mongoose.Schema(
     email: { type: String, default: '' },
     facebook: { type: String, default: '' },
     note: { type: String, default: '' },
+    /** Cá nhân / Doanh nghiệp — import Excel */
+    customerType: { type: String, default: '' },
+    company: { type: String, default: '' },
+    taxId: { type: String, default: '' },
+    citizenId: { type: String, default: '' },
+    /** Mốc ngày giao dịch cuối (import), timestamp ms */
+    lastTransactionAt: { type: Number, default: null },
+    /** active | inactive — import / quản lý */
+    status: { type: String, default: 'active' },
     points: { type: Number, default: 0 },
     debt: { type: Number, default: 0 },
     createdAt: { type: Number },
